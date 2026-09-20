@@ -1355,11 +1355,17 @@ func (m *Manager) fetchProviderModels(ctx context.Context, item Item) {
 		log.Printf("catalog fetch failed account=%s provider=%s: %v", item.ID, item.Provider, err)
 		return
 	}
-	ids := make([]string, 0, len(models)*2)
+	ids := make([]string, 0, len(models)*3)
+	natives := map[string]string{}
 	for _, model := range models {
 		ids = append(ids, model.PublicModel, model.NativeModel, model.DisplayName)
+		if model.PublicModel != "" && model.NativeModel != "" &&
+			CanonicalModelID(model.PublicModel) != CanonicalModelID(model.NativeModel) {
+			natives[model.PublicModel] = model.NativeModel
+		}
 	}
 	m.pool.MergeModels(item.ID, ids)
+	m.pool.MergeModelNatives(item.ID, natives)
 }
 
 func catalogIDs(entries []map[string]any, extras []string) []string {

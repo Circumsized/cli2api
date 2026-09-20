@@ -947,8 +947,10 @@ func appendAliasModels(out []providers.ModelInfo) []providers.ModelInfo {
 			continue
 		}
 		if base, ok := findModelInfoByNativeModel(out, nativeModel); ok {
+			// The alias is a public name only; the native spelling must stay
+			// the real upstream ID or the chat request names a model the
+			// upstream catalog does not contain.
 			clone := base
-			clone.NativeModel = alias
 			clone.PublicModel = alias
 			clone.DisplayName = aliasDisplayName(alias, base.DisplayName)
 			out = append(out, clone)

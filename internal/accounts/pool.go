@@ -111,6 +111,11 @@ type Item struct {
 	// Some upstream models do not consume credits, so an exhausted account
 	// can still serve them.
 	ForceRoute bool
+	// ModelNative maps a canonical public model ID to the provider-native
+	// spelling that must be sent upstream. Providers may expose a public alias
+	// whose native ID differs; routing matches on the public ID but the
+	// request has to carry the native one.
+	ModelNative map[string]string
 	// QuotaDownUntil records a quota-kind account cooldown separately from
 	// DownUntil so a force-route account can keep serving models that do not
 	// consume credits. LastKind is unsuitable for this: MergeHealth clears it
@@ -308,6 +313,9 @@ func NativeModelID(item Item, publicModel string) string {
 	want := routeModel(publicModel)
 	if want == "" {
 		return strings.TrimSpace(publicModel)
+	}
+	if native, ok := item.ModelNative[want]; ok && strings.TrimSpace(native) != "" {
+		return native
 	}
 	for _, model := range item.Models {
 		if CanonicalModelID(model) == want {
@@ -1259,6 +1267,31 @@ func (p *Pool) RemoveModel(id, model string) {
 	}
 }
 
+// MergeModelNatives records the native spelling for public model IDs whose
+// alias differs, so a request can carry the provider-native ID upstream.
+func (p *Pool) MergeModelNatives(id string, natives map[string]string) {
+	if p == nil || id == "" || len(natives) == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.items {
+		if p.items[i].ID != id {
+			continue
+		}
+		if p.items[i].ModelNative == nil {
+			p.items[i].ModelNative = make(map[string]string, len(natives))
+		}
+		for public, native := range natives {
+			if public == "" || strings.TrimSpace(native) == "" {
+				continue
+			}
+			p.items[i].ModelNative[CanonicalModelID(public)] = strings.TrimSpace(native)
+		}
+		return
+	}
+}
+
 func (p *Pool) MergeQuota(id string, quota *QuotaSnapshot) {
 	if p == nil || id == "" {
 		return
@@ -1356,6 +1389,12 @@ func (item Item) clone() Item {
 	}
 	if item.ProvenModels != nil {
 		out.ProvenModels = append([]string(nil), item.ProvenModels...)
+	}
+	if item.ModelNative != nil {
+		out.ModelNative = make(map[string]string, len(item.ModelNative))
+		for k, v := range item.ModelNative {
+			out.ModelNative[k] = v
+		}
 	}
 	if item.Quota != nil {
 		q := *item.Quota

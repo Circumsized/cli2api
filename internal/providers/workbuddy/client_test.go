@@ -457,6 +457,45 @@ func TestModelsParsesReasoningOptions(t *testing.T) {
 	}
 }
 
+// The deepseek alias is a public name only. The upstream catalog has no
+// "deepseek-v4.1-flash" entry, so the alias must keep the native spelling of
+// the model it resolves to; otherwise the chat request names an ID the
+// upstream catalog does not contain and it answers with a quota error.
+func TestAliasModelKeepsNativeSpelling(t *testing.T) {
+	payload, _ := Credential{AccessToken: "at", UID: "u1", Domain: "www.workbuddy.ai", ExpiresAt: 4102444800}.Encode()
+	store := &memStore{items: map[string][]byte{"acc1": payload}, region: "global"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+			"models": []map[string]any{
+				{"id": "deep-model", "name": "Deep", "maxInputTokens": 128000},
+			},
+			"agents": []map[string]any{{"name": "cli", "models": []string{"deep-model"}}},
+		}})
+	}))
+	defer server.Close()
+	client := NewClient(store)
+	client.http = server.Client()
+	client.http.Transport = rewriteTransport{server: server.URL, round: server.Client().Transport}
+
+	models, err := client.Models(context.Background(), "acc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alias providers.ModelInfo
+	found := false
+	for _, model := range models {
+		if model.PublicModel == "deepseek-v4.1-flash" {
+			alias, found = model, true
+		}
+	}
+	if !found {
+		t.Fatalf("alias missing from catalog: %+v", models)
+	}
+	if alias.NativeModel != "deep-model" {
+		t.Fatalf("alias must keep the native upstream ID, got native=%q", alias.NativeModel)
+	}
+}
+
 func TestChatRequestSendsCatalogReasoningEffort(t *testing.T) {
 	payload, _ := Credential{AccessToken: "at", UID: "u1", Domain: "codebuddy.cn", ExpiresAt: 4102444800}.Encode()
 	store := &memStore{items: map[string][]byte{"acc1": payload}}

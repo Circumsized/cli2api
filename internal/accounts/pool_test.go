@@ -570,6 +570,28 @@ func TestQuotaCooledEmptyCatalogSurfacesQuotaHint(t *testing.T) {
 	}
 }
 
+// A public alias whose native ID differs must still send the native spelling
+// upstream; routing keeps matching on the public ID.
+func TestNativeModelIDUsesRecordedNativeSpelling(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "a", Provider: "workbuddy", Region: "global", Runtime: "in_process"})
+	p.MergeModels("a", []string{"deep-model", "deepseek-v4.1-flash", "Deepseek-V4.1-Flash", "hy3"})
+	p.MergeModelNatives("a", map[string]string{"deepseek-v4.1-flash": "deep-model"})
+
+	// Without a recorded native spelling the catalog spelling is used as-is.
+	if got := NativeModelID(Item{Models: []string{"deepseek-v4.1-flash"}}, "deepseek-v4.1-flash"); got != "deepseek-v4.1-flash" {
+		t.Fatalf("fallback native=%q want deepseek-v4.1-flash", got)
+	}
+	item, _ := p.ByID("a")
+	if got := NativeModelID(item, "deepseek-v4.1-flash"); got != "deep-model" {
+		t.Fatalf("native=%q want deep-model", got)
+	}
+	// Models with no differing alias keep their catalog spelling.
+	if got := NativeModelID(item, "hy3"); got != "hy3" {
+		t.Fatalf("native=%q want hy3", got)
+	}
+}
+
 func TestNormalizeModelNameStripsProviderPrefix(t *testing.T) {
 	for input, want := range map[string]string{
 		"DeepSeek: DeepSeek V4.1 Flash": "deepseek-v4.1-flash",
