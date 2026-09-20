@@ -623,6 +623,29 @@ func TestForceRouteBypassesQuotaCooldown(t *testing.T) {
 
 // A non-quota cooldown still applies to a force-route account: rate limits and
 // auth failures mean the account cannot serve anything right now.
+// RefreshAll runs a health merge for every account right after startup, and
+// MergeHealth clears LastKind whenever the probe reports no error. A bypass keyed
+// on LastKind would therefore be wiped before the first request, so the account
+// would block on its quota cooldown again.
+func TestForceRouteQuotaBypassSurvivesHealthMerge(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "forced", Provider: "workbuddy", Region: "global", Runtime: "in_process", ForceRoute: true})
+	p.MergeModels("forced", []string{"deepseek-v4.1-flash"})
+	p.MergeQuota("forced", &QuotaSnapshot{Exceeded: true, Remaining: 0, Total: 100, Unit: "credits"})
+	p.MarkClassified("forced", Classified{Kind: KindQuota, Cooldown: time.Hour, Message: "credits exhausted"})
+
+	p.MergeHealth("forced", true, false, 0, 0, "")
+
+	query := RouteQuery{PublicModel: "deepseek-v4.1-flash", ProviderFilter: "workbuddy"}
+	item, ok := p.PickRoute(query)
+	if !ok || item.ID != "forced" {
+		t.Fatalf("force_route account must stay routable after a health merge, got %+v ok=%v", item, ok)
+	}
+	if retry := p.RetryAfter(item, "deepseek-v4.1-flash"); retry != 0 {
+		t.Fatalf("quota cooldown must stay bypassed, retry-after=%v", retry)
+	}
+}
+
 func TestForceRouteKeepsNonQuotaCooldown(t *testing.T) {
 	p := NewPool(nil, nil)
 	p.Upsert(Item{ID: "forced", Provider: "workbuddy", Region: "global", Runtime: "in_process", ForceRoute: true})

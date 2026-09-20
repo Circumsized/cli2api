@@ -111,6 +111,11 @@ type Item struct {
 	// Some upstream models do not consume credits, so an exhausted account
 	// can still serve them.
 	ForceRoute bool
+	// QuotaDownUntil records a quota-kind account cooldown separately from
+	// DownUntil so a force-route account can keep serving models that do not
+	// consume credits. LastKind is unsuitable for this: MergeHealth clears it
+	// on every health merge with an empty error.
+	QuotaDownUntil time.Time
 	// StateVersion is a process-local monotonic stamp assigned under p.mu
 	// whenever a persistable mutation lands. The persistence observer runs
 	// after p.mu is released, so concurrent observers can enqueue snapshots
@@ -802,20 +807,18 @@ func itemModelDown(item Item, q RouteQuery, now time.Time) bool {
 	return ok && now.Before(until)
 }
 
-// quotaCooldownBypassed reports whether a force-route account's account-level
-// cooldown is a quota cooldown that must not block routing. Only quota
-// cooldowns are bypassed: a rate-limit or auth cooldown still applies, because
-// those mean the account cannot serve any request right now.
-func quotaCooldownBypassed(item Item, now time.Time) bool {
-	return item.ForceRoute && item.LastKind == KindQuota &&
-		!item.DownUntil.IsZero() && now.Before(item.DownUntil)
+// quotaBlocked reports an active quota-kind account cooldown. It is tracked
+// separately from DownUntil so a force-route account can bypass it while any
+// other cooldown kind still holds the account back.
+func quotaBlocked(item Item, now time.Time) bool {
+	return !item.QuotaDownUntil.IsZero() && now.Before(item.QuotaDownUntil)
 }
 
 // resumeAt is the moment an item becomes usable again for this route,
 // considering both account-level and model-level cooldowns.
 func resumeAt(item Item, q RouteQuery) time.Time {
 	next := item.DownUntil
-	if quotaCooldownBypassed(item, time.Now()) {
+	if item.ForceRoute && quotaBlocked(item, time.Now()) {
 		next = time.Time{}
 	}
 	model := routeModel(q.PublicModel)
@@ -946,6 +949,12 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 				}
 				p.items[i].ModelDownUntil[model] = until
 			} else {
+				if c.Kind == KindQuota {
+					p.items[i].QuotaDownUntil = until
+				} else {
+					// A non-quota cooldown supersedes a stale quota one.
+					p.items[i].QuotaDownUntil = time.Time{}
+				}
 				p.items[i].DownUntil = until
 			}
 		}
@@ -1059,6 +1068,7 @@ func (p *Pool) MarkOK(id, model string) {
 			if p.items[i].DownUntil.IsZero() && len(p.items[i].ModelDownUntil) == 0 {
 				p.items[i].LastError = ""
 				p.items[i].LastKind = ""
+				p.items[i].QuotaDownUntil = time.Time{}
 				p.items[i].BackoffLevel = 0
 			}
 			rememberProvenModel(&p.items[i], model)
@@ -1309,10 +1319,11 @@ func (p *Pool) Snapshot() []map[string]any {
 }
 
 func itemDown(item Item, now time.Time) bool {
-	if quotaCooldownBypassed(item, now) {
-		return false
+	until := item.DownUntil
+	if item.ForceRoute && quotaBlocked(item, now) {
+		until = time.Time{}
 	}
-	return !item.DownUntil.IsZero() && now.Before(item.DownUntil)
+	return !until.IsZero() && now.Before(until)
 }
 
 // clone returns a copy of item whose mutable reference fields no longer
@@ -1390,6 +1401,11 @@ func (p *Pool) Upsert(item Item) {
 			// them.
 			if item.DownUntil.IsZero() {
 				item.DownUntil = p.items[i].DownUntil
+			}
+			// Mirrors DownUntil: a caller that does not track quota cooldowns
+			// must not silently drop the force-route bypass.
+			if item.QuotaDownUntil.IsZero() {
+				item.QuotaDownUntil = p.items[i].QuotaDownUntil
 			}
 			if item.LastError == "" {
 				item.LastError = p.items[i].LastError

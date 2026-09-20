@@ -338,9 +338,12 @@ func (m *Manager) restoreCooldowns(ctx context.Context) {
 				item.BackoffLevel = level
 			}
 			item.DownUntil = row.DownUntil
-			// Restore the account-wide last kind too: a force-route account
-			// bypasses a quota cooldown only while LastKind says quota, so
-			// losing it across a restart would let the account block again.
+			// A quota-kind account cooldown must be re-derived so a
+			// force-route account keeps bypassing it after a restart. The
+			// kind lives in the persisted row.
+			if row.Kind == KindQuota {
+				item.QuotaDownUntil = row.DownUntil
+			}
 			if row.Kind != "" && item.LastKind == "" {
 				item.LastKind = row.Kind
 			}
