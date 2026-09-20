@@ -516,8 +516,30 @@ func (e ChatExecutor) ObserveStreamFailure(accountID string, err error, model st
 		if classified.Cooldown <= 0 {
 			classified.Cooldown = accounts.NextLocalMidnightCooldown()
 		}
+		e.applyForceRouteQuota(accountID, classified)
 	}
 	e.markClassified(accountID, classified, model)
+}
+
+// applyForceRouteQuota records a confirmed quota exhaustion on the account
+// snapshot and, when the account is marked force-route, allows the request to
+// fail over instead of failing outright. A force-route account stays on model
+// routes even while exhausted because some models do not consume credits; a
+// quota error on a credit-consuming model must therefore move to another
+// account rather than surface the error to the caller.
+func (e ChatExecutor) applyForceRouteQuota(accountID string, classified accounts.Classified) accounts.Classified {
+	if classified.Kind != accounts.KindQuota || e.Pool == nil || accountID == "" {
+		return classified
+	}
+	item, ok := e.Pool.ByID(accountID)
+	if !ok {
+		return classified
+	}
+	e.Pool.MarkQuotaExhausted(accountID)
+	if item.ForceRoute {
+		classified.Failover = true
+	}
+	return classified
 }
 
 func (e ChatExecutor) handleModelAvailabilityFailure(requestID, source, accountID, model string, classified accounts.Classified) {
@@ -779,6 +801,7 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 		if resp.StatusCode >= 300 {
 			msg := strings.TrimSpace(string(body))
 			classified := classifyWorkerErr(resp, msg)
+			classified = e.applyForceRouteQuota(item.ID, classified)
 			loop.lastErr = providerErrorFromClassified(classified)
 			if classified.Kind == accounts.KindModelNotAvailable {
 				e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "worker_non_stream", item.ID, req.Model, classified)
@@ -860,6 +883,7 @@ func (e ChatExecutor) chatInProcessNonStreamAttempt(ctx context.Context, item ac
 			return ChatResult{AccountID: item.ID, Provider: item.Provider}, accounts.Classified{Kind: accounts.KindUnavailable, Message: err.Error()}, err
 		}
 		classified := e.classifyInProcessError(err)
+		classified = e.applyForceRouteQuota(item.ID, classified)
 		if classified.Kind == accounts.KindModelNotAvailable {
 			e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "provider_non_stream", item.ID, req.Model, classified)
 		}
@@ -909,6 +933,7 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item accou
 			return StreamResult{AccountID: item.ID, Provider: item.Provider}, accounts.Classified{Kind: accounts.KindUnavailable, Message: err.Error()}, err
 		}
 		classified := e.classifyInProcessError(err)
+		classified = e.applyForceRouteQuota(item.ID, classified)
 		if classified.Kind == accounts.KindModelNotAvailable {
 			e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "provider_stream", item.ID, req.Model, classified)
 		}
@@ -1172,6 +1197,7 @@ func (e ChatExecutor) ChatStreamProxy(ctx context.Context, req translate.ChatReq
 			resp.Body.Close()
 			msg := strings.TrimSpace(string(body))
 			classified := classifyWorkerErr(resp, msg)
+			classified = e.applyForceRouteQuota(item.ID, classified)
 			loop.lastErr = providerErrorFromClassified(classified)
 			if classified.Kind == accounts.KindModelNotAvailable {
 				e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "worker_stream", item.ID, req.Model, classified)

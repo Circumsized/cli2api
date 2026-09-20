@@ -490,6 +490,54 @@ func TestObserveStreamFailureCoolsDownQuotaAccount(t *testing.T) {
 	}
 }
 
+// A force-route account stays on the model route even when exhausted, so a
+// quota error on a credit-consuming model must fail over instead of failing
+// the caller outright.
+func TestApplyForceRouteQuotaAllowsFailoverAndMarksExhausted(t *testing.T) {
+	pool := accounts.NewPool(nil, nil)
+	pool.Upsert(accounts.Item{ID: "forced", Provider: "workbuddy", Region: "global", Runtime: "in_process", ForceRoute: true})
+	ex := NewChatExecutor(pool, "")
+
+	classified := ex.applyForceRouteQuota("forced", accounts.Classified{Kind: accounts.KindQuota, Message: "credits exhausted"})
+	if !classified.Failover {
+		t.Fatal("force_route quota error must be failoverable")
+	}
+	item, _ := pool.ByID("forced")
+	if item.Quota == nil || !item.Quota.Exceeded {
+		t.Fatalf("quota error must mark the snapshot exhausted, got %+v", item.Quota)
+	}
+}
+
+func TestApplyForceRouteQuotaLeavesNormalAccountAlone(t *testing.T) {
+	pool := accounts.NewPool(nil, nil)
+	pool.Upsert(accounts.Item{ID: "plain", Provider: "workbuddy", Region: "global", Runtime: "in_process"})
+	ex := NewChatExecutor(pool, "")
+
+	classified := ex.applyForceRouteQuota("plain", accounts.Classified{Kind: accounts.KindQuota, Message: "credits exhausted"})
+	if classified.Failover {
+		t.Fatal("a non-force account's quota error must not fail over")
+	}
+	item, _ := pool.ByID("plain")
+	if item.Quota == nil || !item.Quota.Exceeded {
+		t.Fatalf("quota error must still mark the snapshot exhausted, got %+v", item.Quota)
+	}
+}
+
+func TestApplyForceRouteQuotaIgnoresNonQuotaKinds(t *testing.T) {
+	pool := accounts.NewPool(nil, nil)
+	pool.Upsert(accounts.Item{ID: "forced", Provider: "workbuddy", Region: "global", Runtime: "in_process", ForceRoute: true})
+	ex := NewChatExecutor(pool, "")
+
+	classified := ex.applyForceRouteQuota("forced", accounts.Classified{Kind: accounts.KindRateLimit, Message: "429"})
+	if classified.Failover {
+		t.Fatal("a rate limit must keep its own failover decision")
+	}
+	item, _ := pool.ByID("forced")
+	if item.Quota != nil && item.Quota.Exceeded {
+		t.Fatal("a non-quota error must not mark the snapshot exhausted")
+	}
+}
+
 func TestChatNonStreamDoesNotDispatchWhileAccountCooling(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -52,6 +52,7 @@ type Props = {
   onToggle: (selected: boolean) => void
   onToggleDropSystem: (selected: boolean) => void
   onToggleAutoCheckin?: (selected: boolean) => void
+  onToggleForceRoute?: (selected: boolean) => void
   onCheckin?: () => void
   onViewCheckins?: () => void
   onEdit: () => void
@@ -104,6 +105,7 @@ export function AccountCard({
   onToggle,
   onToggleDropSystem,
   onToggleAutoCheckin,
+  onToggleForceRoute,
   onCheckin,
   onViewCheckins,
   onEdit,
@@ -336,6 +338,20 @@ export function AccountCard({
                 <span className="font-medium">{t('checkinStatus')}</span>
                 <span className="truncate text-foreground/65">{checkin.label}</span>
               </div>
+            </div>
+            <div className="flex items-center justify-between gap-3 text-[11px]">
+              <Tooltip>
+                <Tooltip.Trigger>
+                  <span className="font-medium">{t('forceRoute')}</span>
+                </Tooltip.Trigger>
+                <Tooltip.Content>{t('forceRouteHint')}</Tooltip.Content>
+              </Tooltip>
+              <CompactSwitch
+                isSelected={Boolean(account.force_route)}
+                isDisabled={busyKind === 'toggle' || !onToggleForceRoute}
+                ariaLabel={t('forceRoute')}
+                onChange={(selected) => onToggleForceRoute?.(selected)}
+              />
             </div>
           </div>
         ) : null}

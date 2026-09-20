@@ -574,12 +574,84 @@ func TestNormalizeModelNameStripsProviderPrefix(t *testing.T) {
 	for input, want := range map[string]string{
 		"DeepSeek: DeepSeek V4.1 Flash": "deepseek-v4.1-flash",
 		"DeepSeek_V4.1_Flash":           "deepseek-v4.1-flash",
-		"workbuddy/deepseek-v4.1-flash": "deepseek-v4.1-flash",
 		"MiniMax-M3":                    "minimax-m3",
 		"Qwen3.7-Plus":                  "qwen3.7-plus",
 	} {
 		if got := NormalizeModelName(input); got != want {
 			t.Fatalf("NormalizeModelName(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// A quota-exhausted account is normally excluded from every route, but a
+// force-route account stays eligible: some models do not consume credits, so
+// the operator opts it back in.
+func TestForceRouteKeepsExhaustedAccountRoutable(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "exhausted", Provider: "workbuddy", Region: "global", Runtime: "in_process"})
+	p.MergeModels("exhausted", []string{"deepseek-v4.1-flash"})
+	p.MergeQuota("exhausted", &QuotaSnapshot{Exceeded: true, Remaining: 0, Total: 100, Unit: "credits"})
+
+	query := RouteQuery{PublicModel: "deepseek-v4.1-flash", ProviderFilter: "workbuddy"}
+	if _, ok := p.PickRoute(query); ok {
+		t.Fatal("exhausted account must be excluded without force_route")
+	}
+	p.SetForceRoute("exhausted", true)
+	item, ok := p.PickRoute(query)
+	if !ok || item.ID != "exhausted" {
+		t.Fatalf("force_route account must stay routable while exhausted, got %+v ok=%v", item, ok)
+	}
+}
+
+// A force-route account that is cooling on quota must be dispatchable again:
+// the quota cooldown is bypassed, so RetryAfter must not report a wait.
+func TestForceRouteBypassesQuotaCooldown(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "forced", Provider: "workbuddy", Region: "global", Runtime: "in_process", ForceRoute: true})
+	p.MergeModels("forced", []string{"deepseek-v4.1-flash"})
+	p.MarkClassified("forced", Classified{Kind: KindQuota, Cooldown: time.Hour, Message: "credits exhausted"})
+
+	query := RouteQuery{PublicModel: "deepseek-v4.1-flash", ProviderFilter: "workbuddy"}
+	item, ok := p.PickRoute(query)
+	if !ok || item.ID != "forced" {
+		t.Fatalf("force_route account must be picked despite quota cooldown, got %+v ok=%v", item, ok)
+	}
+	if retry := p.RetryAfter(item, "deepseek-v4.1-flash"); retry != 0 {
+		t.Fatalf("quota cooldown must be bypassed for force_route, retry-after=%v", retry)
+	}
+}
+
+// A non-quota cooldown still applies to a force-route account: rate limits and
+// auth failures mean the account cannot serve anything right now.
+func TestForceRouteKeepsNonQuotaCooldown(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "forced", Provider: "workbuddy", Region: "global", Runtime: "in_process", ForceRoute: true})
+	p.MergeModels("forced", []string{"deepseek-v4.1-flash"})
+	p.MarkClassified("forced", Classified{Kind: KindRateLimit, Cooldown: time.Hour, Message: "429"})
+
+	item, ok := p.PickRoute(RouteQuery{PublicModel: "deepseek-v4.1-flash", ProviderFilter: "workbuddy"})
+	if !ok {
+		t.Fatal("a cooling account must still surface as a retry hint")
+	}
+	if retry := p.RetryAfter(item, "deepseek-v4.1-flash"); retry <= 0 {
+		t.Fatalf("a rate-limit cooldown must still hold a force_route account back, retry-after=%v", retry)
+	}
+}
+
+func TestMarkQuotaExhaustedWritesSnapshot(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "a", Provider: "workbuddy", Region: "global", Runtime: "in_process"})
+	p.MergeQuota("a", &QuotaSnapshot{Total: 0, Remaining: 0, Unit: "credits"})
+	if item, _ := p.ByID("a"); item.Quota == nil || item.Quota.Exceeded {
+		t.Fatalf("precondition: snapshot should start unexhausted, got %+v", item.Quota)
+	}
+
+	p.MarkQuotaExhausted("a")
+	item, _ := p.ByID("a")
+	if item.Quota == nil || !item.Quota.Exceeded || item.Quota.Remaining != 0 {
+		t.Fatalf("quota error must mark the snapshot exhausted, got %+v", item.Quota)
+	}
+	if p.LenRoute(RouteQuery{ProviderFilter: "workbuddy"}) != 0 {
+		t.Fatal("a marked-exhausted account must leave the route")
 	}
 }

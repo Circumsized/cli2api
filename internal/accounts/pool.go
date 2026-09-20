@@ -106,6 +106,11 @@ type Item struct {
 	// DropSystemPrompt mirrors the stored account flag so the executor can
 	// sanitize requests per account without a store lookup per chat.
 	DropSystemPrompt bool
+	// ForceRoute keeps this account on model routes even when its quota is
+	// exhausted, and exempts a quota-kind cooldown so a retry can dispatch.
+	// Some upstream models do not consume credits, so an exhausted account
+	// can still serve them.
+	ForceRoute bool
 	// StateVersion is a process-local monotonic stamp assigned under p.mu
 	// whenever a persistable mutation lands. The persistence observer runs
 	// after p.mu is released, so concurrent observers can enqueue snapshots
@@ -355,7 +360,7 @@ func itemReady(item Item) bool {
 }
 
 func routeBaseMatches(item Item, q RouteQuery) bool {
-	if item.Quota != nil && item.Quota.Exceeded {
+	if item.Quota != nil && item.Quota.Exceeded && !item.ForceRoute {
 		return false
 	}
 	if !itemReady(item) {
@@ -797,10 +802,22 @@ func itemModelDown(item Item, q RouteQuery, now time.Time) bool {
 	return ok && now.Before(until)
 }
 
+// quotaCooldownBypassed reports whether a force-route account's account-level
+// cooldown is a quota cooldown that must not block routing. Only quota
+// cooldowns are bypassed: a rate-limit or auth cooldown still applies, because
+// those mean the account cannot serve any request right now.
+func quotaCooldownBypassed(item Item, now time.Time) bool {
+	return item.ForceRoute && item.LastKind == KindQuota &&
+		!item.DownUntil.IsZero() && now.Before(item.DownUntil)
+}
+
 // resumeAt is the moment an item becomes usable again for this route,
 // considering both account-level and model-level cooldowns.
 func resumeAt(item Item, q RouteQuery) time.Time {
 	next := item.DownUntil
+	if quotaCooldownBypassed(item, time.Now()) {
+		next = time.Time{}
+	}
 	model := routeModel(q.PublicModel)
 	if model != "" {
 		if until, ok := item.ModelDownUntil[model]; ok && (next.IsZero() || until.After(next)) {
@@ -952,6 +969,46 @@ func (p *Pool) MarkClassified(id string, c Classified) {
 	}
 }
 
+// MarkQuotaExhausted records that the upstream explicitly reported the
+// account out of credits. The billing probe can misreport this state (a
+// zeroed total/remaining response is treated as "unknown", not "exceeded"),
+// so a real quota error must be written into the snapshot itself; otherwise
+// routing keeps picking the account and it cools down again after every
+// cooldown expiry. The flag is cleared by the next probe that sees credits.
+func (p *Pool) MarkQuotaExhausted(id string) {
+	if p == nil || id == "" {
+		return
+	}
+	var changed *Item
+	p.mu.Lock()
+	for i := range p.items {
+		if p.items[i].ID != id {
+			continue
+		}
+		if p.items[i].Quota == nil {
+			p.items[i].Quota = &QuotaSnapshot{Unit: "credits"}
+		}
+		if p.items[i].Quota.Exceeded {
+			break
+		}
+		p.items[i].Quota.Exceeded = true
+		p.items[i].Quota.Remaining = 0
+		if p.items[i].Quota.Unit == "" {
+			p.items[i].Quota.Unit = "credits"
+		}
+		p.stateCounter++
+		p.items[i].StateVersion = p.stateCounter
+		snapshot := p.items[i].clone()
+		changed = &snapshot
+		break
+	}
+	observer := p.observer
+	p.mu.Unlock()
+	if changed != nil && observer != nil {
+		observer(*changed)
+	}
+}
+
 // MarkOK records a success. When model is non-empty, only that model's
 // cooldown and backoff ladder are cleared: a success on model-B must not
 // un-cool a still-rate-limited model-A, and a streaming 200 (headers only)
@@ -1040,6 +1097,22 @@ func (p *Pool) SetDropSystemPrompt(id string, drop bool) {
 	for i := range p.items {
 		if p.items[i].ID == id {
 			p.items[i].DropSystemPrompt = drop
+			return
+		}
+	}
+}
+
+// SetForceRoute updates only the quota-bypass flag on a live item. Routing
+// picks it up on the next request without restarting the account.
+func (p *Pool) SetForceRoute(id string, force bool) {
+	if p == nil || id == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.items {
+		if p.items[i].ID == id {
+			p.items[i].ForceRoute = force
 			return
 		}
 	}
@@ -1236,6 +1309,9 @@ func (p *Pool) Snapshot() []map[string]any {
 }
 
 func itemDown(item Item, now time.Time) bool {
+	if quotaCooldownBypassed(item, now) {
+		return false
+	}
 	return !item.DownUntil.IsZero() && now.Before(item.DownUntil)
 }
 

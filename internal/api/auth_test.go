@@ -534,7 +534,7 @@ func TestAccountsAPICreatesAndListsDisabledAccount(t *testing.T) {
 		QoderHome:   t.TempDir(),
 		DataDir:     dataDir,
 	})
-	body := bytes.NewBufferString(`{"name":"Work","enabled":false,"max_inflight":5,"drop_system_prompt":false}`)
+	body := bytes.NewBufferString(`{"name":"Work","enabled":false,"max_inflight":5,"drop_system_prompt":false,"force_route":true}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/accounts", body)
 	req.Header.Set("Authorization", "Bearer secret")
 	req.Header.Set("Content-Type", "application/json")
@@ -557,12 +557,13 @@ func TestAccountsAPICreatesAndListsDisabledAccount(t *testing.T) {
 			Enabled          bool   `json:"enabled"`
 			MaxInFlight      int    `json:"max_inflight"`
 			DropSystemPrompt bool   `json:"drop_system_prompt"`
+			ForceRoute       bool   `json:"force_route"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Data) != 1 || payload.Data[0].Name != "Work" || payload.Data[0].Enabled || payload.Data[0].MaxInFlight != 5 || payload.Data[0].DropSystemPrompt {
+	if len(payload.Data) != 1 || payload.Data[0].Name != "Work" || payload.Data[0].Enabled || payload.Data[0].MaxInFlight != 5 || payload.Data[0].DropSystemPrompt || !payload.Data[0].ForceRoute {
 		t.Fatalf("accounts payload = %+v", payload.Data)
 	}
 }

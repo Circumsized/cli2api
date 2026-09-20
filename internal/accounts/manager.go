@@ -206,6 +206,15 @@ func (m *Manager) drainCooldowns() {
 		if err == nil {
 			err = m.store.SaveCooldowns(ctx, item.ID, cooldownRows(item))
 		}
+		// Persist the quota snapshot too: an exhaustion confirmed by an
+		// upstream quota error is written into the pool snapshot, and it must
+		// survive a restart the same way the cooldown does. RecordPoolState
+		// runs first so SaveQuota's quota_exhausted status wins when the
+		// snapshot is exceeded. SaveQuota never clobbers a non-exceeded
+		// status such as 'cooling'.
+		if err == nil && item.Quota != nil {
+			err = m.store.SaveQuota(ctx, item.ID, item.Quota)
+		}
 		m.persistMu.Lock()
 		if err != nil {
 			// The write failed (SQLite locked, disk error, connection). Put
@@ -329,6 +338,12 @@ func (m *Manager) restoreCooldowns(ctx context.Context) {
 				item.BackoffLevel = level
 			}
 			item.DownUntil = row.DownUntil
+			// Restore the account-wide last kind too: a force-route account
+			// bypasses a quota cooldown only while LastKind says quota, so
+			// losing it across a restart would let the account block again.
+			if row.Kind != "" && item.LastKind == "" {
+				item.LastKind = row.Kind
+			}
 		} else {
 			// Model-scoped row: restore only the model's own backoff,
 			// not the account-wide ladder. Writing the model's level into
@@ -482,7 +497,8 @@ func (m *Manager) startAccount(ctx context.Context, account Account) error {
 		m.pool.Upsert(Item{
 			ID: account.ID, Provider: descriptor.ID, Region: account.ProviderRegion,
 			Runtime: string(descriptor.Runtime), DropSystemPrompt: account.DropSystemPrompt,
-			Weight: NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
+			ForceRoute: account.ForceRoute,
+			Weight:     NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
 			RuntimeState: "starting",
 		})
 		return nil
@@ -502,8 +518,9 @@ func (m *Manager) startAccount(ctx context.Context, account Account) error {
 	notReady := false
 	m.pool.Upsert(Item{
 		ID: account.ID, Provider: descriptor.ID, Region: account.ProviderRegion,
-		Runtime: string(descriptor.Runtime),
-		Weight:  NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
+		Runtime:    string(descriptor.Runtime),
+		ForceRoute: account.ForceRoute,
+		Weight:     NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
 		Ready: &notReady, RuntimeState: "starting",
 	})
 
@@ -532,7 +549,8 @@ func (m *Manager) startAccount(ctx context.Context, account Account) error {
 	m.pool.Upsert(Item{
 		ID: account.ID, URL: process.URL(), Provider: descriptor.ID,
 		Region: account.ProviderRegion, Runtime: string(descriptor.Runtime), Restarts: restarts,
-		Weight: NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
+		ForceRoute: account.ForceRoute,
+		Weight:     NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
 		Ready: &notReady, RuntimeState: "starting",
 	})
 	go m.watchAccount(account.ID, process)
@@ -701,6 +719,9 @@ func (m *Manager) Update(ctx context.Context, id string, input UpdateAccount) er
 	// without restarting anything.
 	if before.DropSystemPrompt != after.DropSystemPrompt {
 		m.pool.SetDropSystemPrompt(id, after.DropSystemPrompt)
+	}
+	if before.ForceRoute != after.ForceRoute {
+		m.pool.SetForceRoute(id, after.ForceRoute)
 	}
 	if before.Priority != after.Priority {
 		m.pool.SetWeight(id, after.Priority)
@@ -915,6 +936,7 @@ type ImportAccount struct {
 	DropSystemPrompt     *bool
 	WorkBuddyAutoCheckin *bool
 	WorkBuddyCheckinTime string
+	ForceRoute           *bool
 	Credential           NativeCredential
 }
 
@@ -938,6 +960,7 @@ func (m *Manager) Import(ctx context.Context, input ImportAccount) (Account, err
 		MaxInFlight: input.MaxInFlight, Priority: input.Priority, DropSystemPrompt: input.DropSystemPrompt,
 		WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin,
 		WorkBuddyCheckinTime: input.WorkBuddyCheckinTime,
+		ForceRoute:           input.ForceRoute,
 	})
 	if err != nil {
 		return Account{}, err
@@ -1209,6 +1232,15 @@ func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prob
 func (m *Manager) persistQuota(ctx context.Context, accountID string, quota *QuotaSnapshot) {
 	if quota == nil {
 		return
+	}
+	// A probe that cannot determine the plan (total and remaining both zero)
+	// must not clear an exhaustion the upstream itself confirmed. Otherwise an
+	// account that keeps answering "credits exhausted" but reports no plan
+	// would be re-admitted to routing on every probe and cool down again.
+	if !quota.Exceeded && quota.Total <= 0 && quota.Remaining <= 0 {
+		if item, ok := m.pool.ByID(accountID); ok && item.Quota != nil && item.Quota.Exceeded {
+			return
+		}
 	}
 	m.pool.MergeQuota(accountID, quota)
 	if err := m.store.SaveQuota(ctx, accountID, quota); err != nil {

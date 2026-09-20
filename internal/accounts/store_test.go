@@ -350,6 +350,33 @@ func TestStoreDefaultsDropSystemPromptOn(t *testing.T) {
 	}
 }
 
+func TestStoreForceRouteDefaultsOffAndRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "qoder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	account, err := store.Create(ctx, CreateAccount{Name: "wb", Provider: "workbuddy", Region: "cn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.ForceRoute {
+		t.Fatalf("new account must default to force_route off: %+v", account)
+	}
+	reloaded, err := store.Get(ctx, account.ID)
+	if err != nil || reloaded.ForceRoute {
+		t.Fatalf("reloaded=%+v err=%v", reloaded, err)
+	}
+	if err := store.Update(ctx, account.ID, UpdateAccount{ForceRoute: boolPtr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.Get(ctx, account.ID)
+	if err != nil || !updated.ForceRoute {
+		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+}
+
 func TestStoreCreateHonorsDropSystemPromptAndInFlight(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenStore(filepath.Join(t.TempDir(), "qoder.db"))

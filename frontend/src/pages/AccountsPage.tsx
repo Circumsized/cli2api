@@ -68,6 +68,7 @@ export function AccountsPage() {
   const [enabledById, setEnabledById] = useState<Record<string, boolean>>({})
   const [dropSystemById, setDropSystemById] = useState<Record<string, boolean>>({})
   const [autoCheckinById, setAutoCheckinById] = useState<Record<string, boolean>>({})
+  const [forceRouteById, setForceRouteById] = useState<Record<string, boolean>>({})
   const [nameById, setNameById] = useState<Record<string, string>>({})
   const [inflightById, setInflightById] = useState<Record<string, number>>({})
   const [priorityById, setPriorityById] = useState<Record<string, number>>({})
@@ -106,6 +107,7 @@ export function AccountsPage() {
     const enabled = enabledById[account.id]
     const dropSystem = dropSystemById[account.id]
     const autoCheckin = autoCheckinById[account.id]
+    const forceRoute = forceRouteById[account.id]
     const name = nameById[account.id]
     const inflight = inflightById[account.id]
     const priority = priorityById[account.id]
@@ -113,6 +115,7 @@ export function AccountsPage() {
     if (enabled !== undefined) next = { ...next, enabled }
     if (dropSystem !== undefined) next = { ...next, drop_system_prompt: dropSystem }
     if (autoCheckin !== undefined) next = { ...next, workbuddy_auto_checkin: autoCheckin }
+    if (forceRoute !== undefined) next = { ...next, force_route: forceRoute }
     if (name !== undefined) next = { ...next, name }
     if (inflight !== undefined) next = { ...next, max_inflight: inflight }
     if (priority !== undefined) next = { ...next, priority }
@@ -279,6 +282,19 @@ export function AccountsPage() {
       await reloadAccounts(false)
     })
     setAutoCheckinById((current) => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+  }
+
+  async function onToggleForceRoute(id: string, selected: boolean) {
+    setForceRouteById((current) => ({ ...current, [id]: selected }))
+    await run(id, 'toggle', async () => {
+      await updateAccount(id, { force_route: selected })
+      await reloadAccounts(false)
+    })
+    setForceRouteById((current) => {
       const next = { ...current }
       delete next[id]
       return next
@@ -497,6 +513,7 @@ export function AccountsPage() {
             onToggle={(selected) => void onToggle(account.id, selected)}
             onToggleDropSystem={(selected) => void onToggleDropSystem(account.id, selected)}
             onToggleAutoCheckin={(selected) => void onToggleAutoCheckin(account.id, selected)}
+            onToggleForceRoute={(selected) => void onToggleForceRoute(account.id, selected)}
             onCheckin={account.provider === 'workbuddy' ? () => void onCheckin(account.id) : undefined}
             onViewCheckins={account.provider === 'workbuddy' ? () => setCheckinHistoryId(account.id) : undefined}
             onEdit={() => setEditId(account.id)}
