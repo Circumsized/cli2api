@@ -242,7 +242,11 @@ func (s *Server) fetchProviderModels(refresh bool, accountID string) ([]map[stri
 		}
 		sawAny = true
 		for _, model := range models {
-			key := model.NativeModel + "@" + item.Provider
+			// Dedupe on the public ID: it is what the response exposes as
+			// "id", and two public names may legitimately share one native
+			// spelling (a provider alias). Deduping on the native ID would
+			// drop the alias from the list.
+			key := model.PublicModel + "@" + item.Provider
 			if _, dup := seen[key]; dup {
 				continue
 			}
