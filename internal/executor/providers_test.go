@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
@@ -361,3 +362,158 @@ func TestProviderPickFiltersByProviderFamily(t *testing.T) {
 }
 
 var _ = json.RawMessage{}
+
+// recordingProviderChat records which provider family served each call, so a
+// cross-provider chain can be asserted by the sequence of families tried.
+type recordingProviderChat struct {
+	seen []string
+	// failWith, when set for a family, is returned for that family's accounts.
+	failWith map[string]error
+}
+
+func (f *recordingProviderChat) ChatNonStream(ctx context.Context, accountID string, req translate.ChatRequest) (providers.ChatOutcome, error) {
+	f.seen = append(f.seen, accountID)
+	// An exact account ID wins; otherwise fall back to the family prefix so a
+	// test can fail a whole family at once.
+	if err, ok := f.failWith[accountID]; ok {
+		return providers.ChatOutcome{}, err
+	}
+	family := accountID
+	if idx := strings.Index(accountID, ":"); idx >= 0 {
+		family = accountID[:idx]
+	}
+	if err, ok := f.failWith[family]; ok {
+		return providers.ChatOutcome{}, err
+	}
+	return providers.ChatOutcome{Model: req.Model, Content: "OK-" + accountID, FinishReason: "stop"}, nil
+}
+
+func (f *recordingProviderChat) ChatStream(ctx context.Context, accountID string, req translate.ChatRequest) (*http.Response, error) {
+	return nil, errors.New("stream unsupported in fake")
+}
+
+// families maps the recorded account IDs onto their provider families.
+func (f *recordingProviderChat) families() []string {
+	out := make([]string, 0, len(f.seen))
+	for _, id := range f.seen {
+		if idx := strings.Index(id, ":"); idx >= 0 {
+			out = append(out, id[:idx])
+		} else {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// TestBareModelFailsOverAcrossProviders is the cross-provider guarantee: when
+// every account of the primary family is exhausted, a bare model ID must reach
+// a second family instead of failing. Before the per-family budget existed the
+// loop stopped inside the first family and never tried the fallback.
+func TestBareModelFailsOverAcrossProviders(t *testing.T) {
+	pool := accounts.NewPool(nil, nil)
+	pool.Upsert(accounts.Item{ID: "wb:1", Provider: "workbuddy", Runtime: "in_process",
+		Models: []string{"hy3"}})
+	pool.Upsert(accounts.Item{ID: "wb:2", Provider: "workbuddy", Runtime: "in_process",
+		Models: []string{"hy3"}})
+	pool.Upsert(accounts.Item{ID: "oc:1", Provider: "openaicompat", Runtime: "in_process",
+		Models: []string{"hy3"}})
+
+	registry := providers.NewRegistry()
+	rec := &recordingProviderChat{failWith: map[string]error{
+		"wb": &providers.Error{Kind: accounts.KindQuota, Status: 429, Message: "credits exhausted"},
+	}}
+	registry.Register(providers.Adapter{ID: "workbuddy", Chat: rec})
+	registry.Register(providers.Adapter{ID: "openaicompat", Chat: rec})
+
+	ex := NewChatExecutor(pool, "")
+	ex.Providers = registry
+	got, err := ex.ChatNonStream(context.Background(), translate.ChatRequest{
+		Model: "hy3", Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}},
+	}, "", "")
+	if err != nil {
+		t.Fatalf("cross-provider failover must succeed: %v (tried %v)", err, rec.seen)
+	}
+	if got.Provider != "openaicompat" {
+		t.Fatalf("expected the fallback family to serve, got %+v (tried %v)", got, rec.seen)
+	}
+	// The primary family must be bounded, not scanned exhaustively.
+	wbTries := 0
+	for _, f := range rec.families() {
+		if f == "wb" {
+			wbTries++
+		}
+	}
+	if wbTries > maxAttemptsPerProvider {
+		t.Fatalf("primary family consumed %d attempts, cap is %d (tried %v)",
+			wbTries, maxAttemptsPerProvider, rec.seen)
+	}
+}
+
+// TestPrefixedModelStaysInsideItsProvider is the guard on the other side: an
+// explicit provider prefix is the caller's stated intent, so it must never
+// fail over to a different family even when the prefixed family is exhausted.
+func TestPrefixedModelStaysInsideItsProvider(t *testing.T) {
+	pool := accounts.NewPool(nil, nil)
+	pool.Upsert(accounts.Item{ID: "wb:1", Provider: "workbuddy", Runtime: "in_process",
+		Models: []string{"hy3"}})
+	pool.Upsert(accounts.Item{ID: "oc:1", Provider: "openaicompat", Runtime: "in_process",
+		Models: []string{"hy3"}})
+
+	registry := providers.NewRegistry()
+	rec := &recordingProviderChat{failWith: map[string]error{
+		"wb": &providers.Error{Kind: accounts.KindQuota, Status: 429, Message: "credits exhausted"},
+	}}
+	registry.Register(providers.Adapter{ID: "workbuddy", Chat: rec})
+	registry.Register(providers.Adapter{ID: "openaicompat", Chat: rec})
+
+	ex := NewChatExecutor(pool, "")
+	ex.Providers = registry
+	_, err := ex.ChatNonStream(context.Background(), translate.ChatRequest{
+		Model: "workbuddy/hy3", Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}},
+	}, "", "workbuddy")
+	if err == nil {
+		t.Fatalf("a prefixed model must not escape its family (tried %v)", rec.seen)
+	}
+	for _, f := range rec.families() {
+		if f != "wb" {
+			t.Fatalf("prefixed request reached %q; only workbuddy was authorized (tried %v)", f, rec.seen)
+		}
+	}
+}
+
+// TestSingleFamilyStillReachesLaterAccounts guards a regression found live: the
+// per-family attempt cap is only meaningful when another family exists. Applied
+// to a single-family pool it stopped the chain after maxAttemptsPerProvider
+// accounts, so a healthy third account was never tried and a request that used
+// to succeed started returning 429.
+func TestSingleFamilyStillReachesLaterAccounts(t *testing.T) {
+	pool := accounts.NewPool(nil, nil)
+	// Three workbuddy accounts: two exhausted, the last healthy. This mirrors
+	// the real pool where ch and qiu are spent and github still has allowance.
+	for _, id := range []string{"wb:ch", "wb:qiu"} {
+		pool.Upsert(accounts.Item{ID: id, Provider: "workbuddy", Runtime: "in_process",
+			ForceRoute: true, Models: []string{"hy3"},
+			Quota: &accounts.QuotaSnapshot{Exceeded: true, Unit: "credits"}})
+	}
+	pool.Upsert(accounts.Item{ID: "wb:github", Provider: "workbuddy", Runtime: "in_process",
+		Models: []string{"hy3"}})
+
+	registry := providers.NewRegistry()
+	rec := &recordingProviderChat{failWith: map[string]error{
+		"wb:ch":  &providers.Error{Kind: accounts.KindQuota, Status: 429, Message: "credits exhausted"},
+		"wb:qiu": &providers.Error{Kind: accounts.KindQuota, Status: 429, Message: "credits exhausted"},
+	}}
+	registry.Register(providers.Adapter{ID: "workbuddy", Chat: rec})
+
+	ex := NewChatExecutor(pool, "")
+	ex.Providers = registry
+	got, err := ex.ChatNonStream(context.Background(), translate.ChatRequest{
+		Model: "hy3", Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}},
+	}, "", "")
+	if err != nil {
+		t.Fatalf("a single-family pool must still reach its healthy account: %v (tried %v)", err, rec.seen)
+	}
+	if got.Content != "OK-wb:github" {
+		t.Fatalf("expected the healthy account to serve, got %+v (tried %v)", got, rec.seen)
+	}
+}

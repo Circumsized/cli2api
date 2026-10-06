@@ -647,10 +647,11 @@ func (c *Client) Quota(ctx context.Context, accountID string) (*providers.QuotaI
 	if err != nil {
 		return nil, err
 	}
-	remain, used, total, err := c.UserResource(ctx, credential)
+	summary, err := c.UserResourceDetail(ctx, credential)
 	if err != nil {
 		return nil, err
 	}
+	remain, used, total := summary.Remain, summary.Used, summary.Size
 	if total <= 0 && remain > 0 {
 		total = remain
 	}
@@ -667,14 +668,35 @@ func (c *Client) Quota(ctx context.Context, accountID string) (*providers.QuotaI
 			percentage = 100
 		}
 	}
+	// An account with no capacity package at all (no subscription) cannot
+	// serve any model. Reporting that as a definite answer — rather than as a
+	// zeroed "unknown" probe — is what stops the routing loop where such an
+	// account is re-admitted on every health refresh, answers 14018, and is
+	// cooled down again.
+	noCapacity := summary.Packages == 0 && total <= 0 && remain <= 0
+	// Upstream admits a chat only when some package still has cycle allowance.
+	// A package balance can be non-zero while the cycle is spent, so the cycle
+	// sum — not the package balance — decides exhaustion once cycle data is
+	// present.
+	exceeded := false
+	switch {
+	case summary.HasCycle:
+		exceeded = summary.CycleRemain <= 0
+	case noCapacity:
+		exceeded = true
+	default:
+		exceeded = total > 0 && remain <= 0
+	}
 	return &providers.QuotaInfo{
-		Used:       float64(used),
-		Total:      float64(total),
-		Remaining:  float64(remain),
-		Percentage: percentage,
-		Unit:       "credits",
-		Exceeded:   total > 0 && remain <= 0,
-		FetchedAt:  time.Now().UTC().Format(time.RFC3339),
+		Used:        float64(used),
+		Total:       float64(total),
+		Remaining:   float64(remain),
+		Percentage:  percentage,
+		Unit:        "credits",
+		Exceeded:    exceeded,
+		CycleRemain: float64(summary.CycleRemain),
+		NoCapacity:  noCapacity,
+		FetchedAt:   time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
 
@@ -793,8 +815,34 @@ func (c *Client) Keepalive(ctx context.Context, accountID string) error {
 	return err
 }
 
+// userResourceSummary is the aggregated billing answer. CycleRemain is the
+// figure upstream gates chat on; Packages counts the capacity packages the
+// account actually holds, so a successful probe returning zero packages is a
+// definite "this account cannot serve" rather than an unknown. HasCycle
+// reports whether any package carried cycle-scoped figures, which decides
+// whether CycleRemain is authoritative or merely absent.
+type userResourceSummary struct {
+	Remain      int64
+	Used        int64
+	Size        int64
+	CycleRemain int64
+	HasCycle    bool
+	Packages    int
+}
+
 // UserResource aggregates package remain/used/total from get-user-resource.
 func (c *Client) UserResource(ctx context.Context, credential Credential) (remain, used, total int64, err error) {
+	summary, err := c.UserResourceDetail(ctx, credential)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return summary.Remain, summary.Used, summary.Size, nil
+}
+
+// UserResourceDetail is UserResource plus the cycle-scoped remaining allowance
+// and the package count. Callers that decide routing should use this: the
+// package balance alone cannot tell a spent cycle from an unusable account.
+func (c *Client) UserResourceDetail(ctx context.Context, credential Credential) (userResourceSummary, error) {
 	now := time.Now()
 	payload, err := json.Marshal(map[string]any{
 		"PageNumber":               1,
@@ -805,15 +853,15 @@ func (c *Client) UserResource(ctx context.Context, credential Credential) (remai
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
 	if err != nil {
-		return 0, 0, 0, err
+		return userResourceSummary{}, err
 	}
 	body, status, err := c.do(ctx, http.MethodPost, credential.BillingBase()+pathUserResource, payload,
 		func(h http.Header) { SetBillingHeaders(h, credential) })
 	if err != nil {
-		return 0, 0, 0, err
+		return userResourceSummary{}, err
 	}
 	if status >= 300 {
-		return 0, 0, 0, fmt.Errorf("user-resource status=%d: %s", status, strings.TrimSpace(string(body)))
+		return userResourceSummary{}, fmt.Errorf("user-resource status=%d: %s", status, strings.TrimSpace(string(body)))
 	}
 	var env struct {
 		Code int    `json:"code"`
@@ -828,13 +876,12 @@ func (c *Client) UserResource(ctx context.Context, credential Credential) (remai
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
-		return 0, 0, 0, fmt.Errorf("user-resource parse: %w", err)
+		return userResourceSummary{}, fmt.Errorf("user-resource parse: %w", err)
 	}
 	if env.Code != 0 {
-		return 0, 0, 0, fmt.Errorf("user-resource code=%d msg=%s", env.Code, env.Msg)
+		return userResourceSummary{}, fmt.Errorf("user-resource code=%d msg=%s", env.Code, env.Msg)
 	}
-	remain, used, total = aggregateUserResource(env.Data.Response.Data.Accounts, env.Data.Response.Data.TotalDosage)
-	return remain, used, total, nil
+	return aggregateUserResourceDetail(env.Data.Response.Data.Accounts, env.Data.Response.Data.TotalDosage), nil
 }
 
 type resourcePackage struct {
@@ -887,24 +934,40 @@ func packageRemainUsed(pkg resourcePackage) (remain, used, size int64) {
 }
 
 func aggregateUserResource(packages []resourcePackage, totalDosage int64) (remain, used, size int64) {
+	s := aggregateUserResourceDetail(packages, totalDosage)
+	return s.Remain, s.Used, s.Size
+}
+
+// aggregateUserResourceDetail sums package balances and, separately, the
+// cycle-scoped remaining allowance. The two are independent: a package keeps
+// CapacityRemain after its cycle is spent, so only the cycle sum predicts
+// whether upstream will admit a chat request.
+func aggregateUserResourceDetail(packages []resourcePackage, totalDosage int64) userResourceSummary {
+	out := userResourceSummary{Packages: len(packages)}
 	for _, pkg := range packages {
 		r, u, s := packageRemainUsed(pkg)
-		remain += r
-		used += u
-		size += s
-	}
-	if size > 0 {
-		if derived := size - remain; derived > used {
-			used = derived
+		out.Remain += r
+		out.Used += u
+		out.Size += s
+		if pkg.CycleCapacitySize > 0 || pkg.CycleCapacityUsed > 0 || pkg.CycleCapacityRemain != 0 {
+			out.HasCycle = true
+		}
+		if pkg.CycleCapacityRemain > 0 {
+			out.CycleRemain += pkg.CycleCapacityRemain
 		}
 	}
-	if totalDosage > size {
-		size = totalDosage
-		if derived := size - remain; derived > used {
-			used = derived
+	if out.Size > 0 {
+		if derived := out.Size - out.Remain; derived > out.Used {
+			out.Used = derived
 		}
 	}
-	return remain, used, size
+	if totalDosage > out.Size {
+		out.Size = totalDosage
+		if derived := out.Size - out.Remain; derived > out.Used {
+			out.Used = derived
+		}
+	}
+	return out
 }
 
 // Adapter returns the provider capability bundle for registration.
@@ -946,15 +1009,13 @@ func appendAliasModels(out []providers.ModelInfo) []providers.ModelInfo {
 		if _, ok := seen[alias]; ok {
 			continue
 		}
-		if base, ok := findModelInfoByNativeModel(out, nativeModel); ok {
-			// The alias is a public name only; the native spelling must stay
-			// the real upstream ID or the chat request names a model the
-			// upstream catalog does not contain.
-			clone := base
-			clone.PublicModel = alias
-			clone.DisplayName = aliasDisplayName(alias, base.DisplayName)
-			out = append(out, clone)
-		}
+			if base, ok := findModelInfoByNativeModel(out, nativeModel); ok {
+				clone := base
+				clone.NativeModel = alias
+				clone.PublicModel = alias
+				clone.DisplayName = aliasDisplayName(alias, base.DisplayName)
+				out = append(out, clone)
+			}
 	}
 	return out
 }

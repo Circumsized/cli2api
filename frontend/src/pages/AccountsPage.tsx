@@ -69,6 +69,7 @@ export function AccountsPage() {
   const [dropSystemById, setDropSystemById] = useState<Record<string, boolean>>({})
   const [autoCheckinById, setAutoCheckinById] = useState<Record<string, boolean>>({})
   const [forceRouteById, setForceRouteById] = useState<Record<string, boolean>>({})
+  const [noCooldownById, setNoCooldownById] = useState<Record<string, boolean>>({})
   const [nameById, setNameById] = useState<Record<string, string>>({})
   const [inflightById, setInflightById] = useState<Record<string, number>>({})
   const [priorityById, setPriorityById] = useState<Record<string, number>>({})
@@ -108,6 +109,7 @@ export function AccountsPage() {
     const dropSystem = dropSystemById[account.id]
     const autoCheckin = autoCheckinById[account.id]
     const forceRoute = forceRouteById[account.id]
+    const noCooldown = noCooldownById[account.id]
     const name = nameById[account.id]
     const inflight = inflightById[account.id]
     const priority = priorityById[account.id]
@@ -116,11 +118,12 @@ export function AccountsPage() {
     if (dropSystem !== undefined) next = { ...next, drop_system_prompt: dropSystem }
     if (autoCheckin !== undefined) next = { ...next, workbuddy_auto_checkin: autoCheckin }
     if (forceRoute !== undefined) next = { ...next, force_route: forceRoute }
+    if (noCooldown !== undefined) next = { ...next, no_cooldown: noCooldown }
     if (name !== undefined) next = { ...next, name }
     if (inflight !== undefined) next = { ...next, max_inflight: inflight }
     if (priority !== undefined) next = { ...next, priority }
     return next
-  }), [autoCheckinById, enabledById, dropSystemById, inflightById, nameById, priorityById, rows])
+  }), [autoCheckinById, enabledById, dropSystemById, inflightById, nameById, noCooldownById, priorityById, rows])
 
   const availableCount = displayRows.filter(isAvailable).length
   const attentionCount = displayRows.filter((account) => account.enabled && !isAvailable(account)).length
@@ -295,6 +298,19 @@ export function AccountsPage() {
       await reloadAccounts(false)
     })
     setForceRouteById((current) => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+  }
+
+  async function onToggleNoCooldown(id: string, selected: boolean) {
+    setNoCooldownById((current) => ({ ...current, [id]: selected }))
+    await run(id, 'toggle', async () => {
+      await updateAccount(id, { no_cooldown: selected })
+      await reloadAccounts(false)
+    })
+    setNoCooldownById((current) => {
       const next = { ...current }
       delete next[id]
       return next
@@ -514,6 +530,7 @@ export function AccountsPage() {
             onToggleDropSystem={(selected) => void onToggleDropSystem(account.id, selected)}
             onToggleAutoCheckin={(selected) => void onToggleAutoCheckin(account.id, selected)}
             onToggleForceRoute={(selected) => void onToggleForceRoute(account.id, selected)}
+            onToggleNoCooldown={(selected) => void onToggleNoCooldown(account.id, selected)}
             onCheckin={account.provider === 'workbuddy' ? () => void onCheckin(account.id) : undefined}
             onViewCheckins={account.provider === 'workbuddy' ? () => setCheckinHistoryId(account.id) : undefined}
             onEdit={() => setEditId(account.id)}

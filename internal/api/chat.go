@@ -488,9 +488,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 func providerPrefix(model string) string {
 	model = strings.TrimSpace(model)
-	for _, prefix := range []string{"qoder/", "workbuddy/", "trae/"} {
+	// Derived from the registry so a newly registered provider is routable by
+	// prefix without a second edit here.
+	for _, descriptor := range providers.List() {
+		prefix := descriptor.ID + "/"
 		if strings.HasPrefix(model, prefix) {
-			return strings.TrimSuffix(prefix, "/")
+			return descriptor.ID
 		}
 	}
 	return ""

@@ -17,6 +17,8 @@ export type AccountQuota = {
   resource_package_remaining?: number
   resource_package_unit?: string
   resource_package_available?: boolean
+  cycle_remain?: number
+  no_capacity?: boolean
   fetched_at?: string
 }
 
@@ -119,6 +121,7 @@ export type Overview = {
     workbuddy_auto_checkin?: boolean
     workbuddy_checkin_time?: string
     force_route?: boolean
+    no_cooldown?: boolean
     status?: string
     cooldown_until?: string | null
     url?: string

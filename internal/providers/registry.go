@@ -2,6 +2,7 @@ package providers
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -162,10 +163,31 @@ var Trae = ProviderDescriptor{
 	DefaultRegion: "cn",
 }
 
+// OpenAICompat is a generic OpenAI-compatible provider. It carries no login
+// and no private quota API because the protocol is standard: an operator
+// supplies a base URL and an optional API key.
+var OpenAICompat = ProviderDescriptor{
+	ID:                "openaicompat",
+	Label:             "OpenAI Compatible",
+	Runtime:           RuntimeInProcess,
+	AuthTypes:         []AuthType{AuthNone, AuthPAT},
+	CredentialFormats: []string{"openai-compat-v1"},
+	Capabilities: ProviderCapabilities{
+		Chat: true, Stream: true, Tools: true, Images: false, Reasoning: true,
+		ModelCatalog: true, Usage: true, Login: false, BrowserLogin: false,
+		PATLogin: false, ImportExport: false,
+	},
+	Regions: []RegionDescriptor{
+		{ID: "default", Label: "Default"},
+	},
+	DefaultRegion: "default",
+}
+
 var registry = map[string]ProviderDescriptor{
-	Qoder.ID:     Qoder,
-	WorkBuddy.ID: WorkBuddy,
-	Trae.ID:      Trae,
+	Qoder.ID:        Qoder,
+	WorkBuddy.ID:    WorkBuddy,
+	Trae.ID:         Trae,
+	OpenAICompat.ID: OpenAICompat,
 }
 
 func Get(id string) (ProviderDescriptor, bool) {
@@ -173,8 +195,20 @@ func Get(id string) (ProviderDescriptor, bool) {
 	return d, ok
 }
 
+// List returns every registered descriptor, sorted by ID for stable output.
+// It reads the registry map rather than restating the set, so a newly added
+// provider cannot be missing from the console or from model-prefix routing.
 func List() []ProviderDescriptor {
-	return []ProviderDescriptor{Qoder, WorkBuddy, Trae}
+	ids := make([]string, 0, len(registry))
+	for id := range registry {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]ProviderDescriptor, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, registry[id])
+	}
+	return out
 }
 
 // Resolve validates a provider/region pair. Empty values fall back to the

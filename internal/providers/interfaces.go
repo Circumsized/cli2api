@@ -123,6 +123,15 @@ type QuotaInfo struct {
 	Percentage float64
 	Unit       string
 	Exceeded   bool
+	// CycleRemain is the remaining allowance for the current billing cycle,
+	// summed over every resource package. Upstream gates chat on this value
+	// (sum > 0 admits the request), not on the package balance in Remaining:
+	// an account can hold an untouched package while its cycle is spent.
+	CycleRemain float64
+	// NoCapacity reports a successful probe that found no capacity package at
+	// all (no subscription). It is a definite "cannot serve" answer, unlike a
+	// failed probe which must leave prior state alone.
+	NoCapacity bool
 	FetchedAt  string
 }
 

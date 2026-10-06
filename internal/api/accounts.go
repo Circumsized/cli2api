@@ -3,12 +3,14 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"github.com/caigee-cmd/cli2api/internal/providers"
+	"github.com/caigee-cmd/cli2api/internal/providers/openaicompat"
 	"github.com/caigee-cmd/cli2api/internal/providers/trae"
 	"github.com/caigee-cmd/cli2api/internal/providers/workbuddy"
 )
@@ -45,6 +47,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			WorkBuddyAutoCheckin *bool  `json:"workbuddy_auto_checkin"`
 			WorkBuddyCheckinTime string `json:"workbuddy_checkin_time"`
 			ForceRoute           *bool  `json:"force_route"`
+			NoCooldown           *bool  `json:"no_cooldown"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -60,6 +63,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			DropSystemPrompt: input.DropSystemPrompt, WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin,
 			WorkBuddyCheckinTime: input.WorkBuddyCheckinTime,
 			ForceRoute:           input.ForceRoute,
+			NoCooldown:           input.NoCooldown,
 		})
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "account_create_failed", err.Error())
@@ -93,6 +97,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		WorkBuddyAutoCheckin *bool           `json:"workbuddy_auto_checkin"`
 		WorkBuddyCheckinTime string          `json:"workbuddy_checkin_time"`
 		ForceRoute           *bool           `json:"force_route"`
+	NoCooldown           *bool           `json:"no_cooldown"`
 		UserBlob             string          `json:"user_blob"`
 		MachineID            string          `json:"machine_id"`
 		Credential           json.RawMessage `json:"credential"`
@@ -146,6 +151,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 			WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin,
 			WorkBuddyCheckinTime: input.WorkBuddyCheckinTime,
 			ForceRoute:           input.ForceRoute,
+			NoCooldown:           input.NoCooldown,
 		})
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "account_import_failed", err.Error())
@@ -184,6 +190,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 			WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin,
 			WorkBuddyCheckinTime: input.WorkBuddyCheckinTime,
 			ForceRoute:           input.ForceRoute,
+			NoCooldown:           input.NoCooldown,
 		})
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "account_import_failed", err.Error())
@@ -203,9 +210,56 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		}
 		imported, _ := s.manager.Store().Get(r.Context(), account.ID)
 		writeJSON(w, http.StatusCreated, imported)
+	case openaicompat.CredentialFormat:
+		payload := input.Credential
+		if len(payload) == 0 {
+			payload = json.RawMessage(raw)
+		}
+		if err := (openaicompatCodec{}).validate(payload); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid_credential", err.Error())
+			return
+		}
+		// This provider authenticates with a key, not a browser, so the
+		// account is usable as soon as it is imported.
+		account, err := s.manager.Create(r.Context(), accounts.CreateAccount{
+			Name: input.Name, Provider: "openaicompat", Region: input.Region, Enabled: input.Enabled,
+			MaxInFlight: input.MaxInFlight, Priority: input.Priority, DropSystemPrompt: input.DropSystemPrompt,
+			WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin,
+			WorkBuddyCheckinTime: input.WorkBuddyCheckinTime,
+			ForceRoute:           input.ForceRoute,
+			NoCooldown:           input.NoCooldown,
+		})
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "account_import_failed", err.Error())
+			return
+		}
+		if err := s.manager.Store().SaveCredentialPayload(r.Context(), account.ID, openaicompat.CredentialFormat, payload); err != nil {
+			_ = s.manager.Delete(r.Context(), account.ID)
+			writeErr(w, http.StatusBadRequest, "account_import_failed", err.Error())
+			return
+		}
+		// Re-probe so the catalog and readiness land without a manual refresh.
+		_ = s.manager.RefreshAccount(r.Context(), account.ID, true)
+		imported, _ := s.manager.Store().Get(r.Context(), account.ID)
+		writeJSON(w, http.StatusCreated, imported)
 	default:
-		writeErr(w, http.StatusBadRequest, "unsupported_credential_format", "format must be qoder-native-v1, workbuddy-oauth-v1, or trae-oauth-v1")
+		writeErr(w, http.StatusBadRequest, "unsupported_credential_format", "format must be qoder-native-v1, workbuddy-oauth-v1, trae-oauth-v1, or openai-compat-v1")
 	}
+}
+
+// openaicompatCodec adapts the provider's validator to the API layer. The
+// provider package owns the credential shape, so validation stays there.
+type openaicompatCodec struct{}
+
+func (openaicompatCodec) validate(payload []byte) error {
+	cred, err := openaicompat.DecodeCredential(payload)
+	if err != nil {
+		return err
+	}
+	if !cred.Ready() {
+		return fmt.Errorf("base_url is required")
+	}
+	return nil
 }
 
 func (s *Server) handleAccountByID(w http.ResponseWriter, r *http.Request) {
@@ -236,6 +290,7 @@ func (s *Server) handleAccountByID(w http.ResponseWriter, r *http.Request) {
 				WorkBuddyAutoCheckin *bool   `json:"workbuddy_auto_checkin"`
 				WorkBuddyCheckinTime *string `json:"workbuddy_checkin_time"`
 				ForceRoute           *bool   `json:"force_route"`
+				NoCooldown           *bool   `json:"no_cooldown"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 				writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -246,6 +301,7 @@ func (s *Server) handleAccountByID(w http.ResponseWriter, r *http.Request) {
 				DropSystemPrompt: input.DropSystemPrompt, WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin,
 				WorkBuddyCheckinTime: input.WorkBuddyCheckinTime,
 				ForceRoute:           input.ForceRoute,
+				NoCooldown:           input.NoCooldown,
 			})
 			if err != nil {
 				writeErr(w, http.StatusBadRequest, "account_update_failed", err.Error())

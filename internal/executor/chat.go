@@ -467,6 +467,56 @@ func (e ChatExecutor) attemptsFor(providerFilter, regionFilter, publicModel stri
 	return 1
 }
 
+// crossProviderBudget is the attempt budget for a bare model ID, which may be
+// served by any provider family. A prefixed ID keeps the narrower same-family
+// budget. Counting every family is what lets the chain reach a fallback
+// provider when the primary family is exhausted, instead of stopping inside
+// the first one.
+//
+// The per-family cap applies only when more than one family can serve the
+// request. With a single family, every account in it is a legitimate candidate
+// and the budget must keep them all reachable — capping there would stop the
+// chain before a healthy later account is tried.
+func (e ChatExecutor) crossProviderBudget(publicModel string, allowed []string) (int, bool) {
+	if e.Pool == nil {
+		return 1, false
+	}
+	maxAttempts := e.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 4
+	}
+	if maxAttempts > 64 {
+		maxAttempts = 64
+	}
+	counts := map[string]int{}
+	for _, item := range e.Pool.Items() {
+		if len(allowed) > 0 && !accounts.ProviderAllowed(itemProvider(item), allowed) {
+			continue
+		}
+		if !accounts.ItemCouldServeModel(item, publicModel) {
+			continue
+		}
+		counts[itemProvider(item)]++
+	}
+	if len(counts) == 0 {
+		return 1, false
+	}
+	multiFamily := len(counts) > 1
+	total := 0
+	for _, n := range counts {
+		if multiFamily && n > maxAttemptsPerProvider {
+			// Reserve budget for the other families rather than letting one
+			// family consume the whole chain.
+			n = maxAttemptsPerProvider
+		}
+		total += n
+	}
+	if total > maxAttempts {
+		return maxAttempts, multiFamily
+	}
+	return total, multiFamily
+}
+
 func pinRegion(current, next string) string {
 	if current != "" {
 		return current
@@ -662,7 +712,28 @@ type routeLoop struct {
 	attempts       int
 	pinned         string
 	index          int
+	// crossProvider is true for a bare model ID, which may be served by any
+	// provider family. An explicitly prefixed ID pins one family and must
+	// never leave it, because the prefix is the caller's stated intent.
+	crossProvider bool
+	// multiFamily is true when more than one provider family can serve this
+	// request. The per-family cap only applies then: inside a single family
+	// every account is a legitimate candidate and must stay reachable.
+	multiFamily bool
+	// providerTries counts attempts already spent on each family. Without a
+	// per-family cap a single exhausted family can consume the whole attempt
+	// budget and starve a healthy family later in the chain.
+	providerTries map[string]int
+	// currentProvider is the family of the last successful pick. A change of
+	// family invalidates the region pin, because regions are provider-scoped.
+	currentProvider string
 }
+
+// maxAttemptsPerProvider bounds how many attempts one provider family may
+// consume within a single request while another family is still available. It
+// keeps a cross-provider chain from degenerating into an exhaustive scan of a
+// dead family.
+const maxAttemptsPerProvider = 2
 
 func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter string, req translate.ChatRequest) routeLoop {
 	prefer, providerFilter, regionFilter, routing := e.prepareRouting(ctx, prefer, providerFilter, req)
@@ -672,6 +743,16 @@ func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter s
 		}
 	}
 	allowed := allowedProvidersFrom(ctx)
+	// A bare model ID may be served by any provider family. A prefixed ID
+	// names one family and must stay inside it: the prefix is the caller's
+	// explicit intent, so crossing families would answer a different question
+	// than the one asked.
+	crossProvider := providerFilter == "" && providerPrefixOf(req.Model) == ""
+	attempts := e.attemptsFor(providerFilter, regionFilter, req.Model, allowed)
+	multiFamily := false
+	if crossProvider {
+		attempts, multiFamily = e.crossProviderBudget(req.Model, allowed)
+	}
 	loop := routeLoop{
 		requestID:      RequestIDFromContext(ctx),
 		prefer:         prefer,
@@ -680,7 +761,10 @@ func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter s
 		routing:        routing,
 		excluded:       map[string]struct{}{},
 		allowed:        allowed,
-		attempts:       e.attemptsFor(providerFilter, regionFilter, req.Model, allowed),
+		attempts:       attempts,
+		crossProvider:  crossProvider,
+		multiFamily:    multiFamily,
+		providerTries:  map[string]int{},
 	}
 	if routing.Source == routingPin {
 		loop.pinned = prefer
@@ -688,7 +772,23 @@ func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter s
 	return loop
 }
 
+// providerPrefixOf reports the provider named by a model prefix, or "" for a
+// bare ID.
+func providerPrefixOf(model string) string {
+	model = strings.TrimSpace(model)
+	if idx := strings.Index(model, "/"); idx > 0 {
+		return strings.ToLower(model[:idx])
+	}
+	return ""
+}
+
 func (l *routeLoop) pickNext(e ChatExecutor, publicModel string) (accounts.Item, int, error) {
+	// When the current family has spent its share of the budget, the region
+	// pin must be dropped before the next pick: a region belongs to one
+	// provider, so keeping it would exclude every other family's accounts.
+	if l.multiFamily && l.currentProvider != "" && l.providerTries[l.currentProvider] >= maxAttemptsPerProvider {
+		l.regionFilter = ""
+	}
 	item, err := e.pick(l.requestID, l.prefer, l.providerFilter, l.regionFilter, publicModel, l.allowed, l.excluded)
 	if err != nil {
 		return accounts.Item{}, l.index, err
@@ -696,16 +796,61 @@ func (l *routeLoop) pickNext(e ChatExecutor, publicModel string) (accounts.Item,
 	attemptIndex := l.index
 	e.observeRouting(&l.routing, item.ID)
 	l.prefer = ""
+	provider := itemProvider(item)
+	if l.crossProvider && provider != l.currentProvider {
+		// Family changed: re-pin the region from the new family's account.
+		l.regionFilter = ""
+	}
+	l.currentProvider = provider
+	l.providerTries[provider]++
 	if l.regionFilter == "" {
 		l.regionFilter = pinRegion(l.regionFilter, item.Region)
+	}
+	// Recompute the budget from the pinned route, but only inside one family.
+	// Across families the budget is the sum over all of them, so narrowing it
+	// here would cut the chain off before the fallback family is reached.
+	if !l.crossProvider {
 		l.attempts = e.attemptsFor(l.providerFilter, l.regionFilter, publicModel, l.allowed)
 	}
 	l.index++
 	return item, attemptIndex, nil
 }
 
-func (l routeLoop) canFailover(classified accounts.Classified) bool {
-	return classified.Failover && l.index < l.attempts
+func (l routeLoop) canFailover(e ChatExecutor, classified accounts.Classified) bool {
+	if !classified.Failover || l.index >= l.attempts {
+		return false
+	}
+	// Inside one family the budget alone bounds the chain. Across families an
+	// extra guard keeps a single dead family from consuming the whole budget
+	// before a healthy one is reached.
+	if l.multiFamily && l.currentProvider != "" && l.providerTries[l.currentProvider] >= maxAttemptsPerProvider {
+		return e.hasOtherProvider(l)
+	}
+	return true
+}
+
+// hasOtherProvider reports whether any provider family other than the current
+// one still has a usable account for this request.
+func (e ChatExecutor) hasOtherProvider(l routeLoop) bool {
+	if e.Pool == nil {
+		return false
+	}
+	for _, item := range e.Pool.Items() {
+		if itemProvider(item) == l.currentProvider {
+			continue
+		}
+		if _, skip := l.excluded[item.ID]; skip {
+			continue
+		}
+		if !accounts.ItemCouldServeModel(item, l.routing.PublicModel) {
+			continue
+		}
+		if len(l.allowed) > 0 && !accounts.ProviderAllowed(itemProvider(item), l.allowed) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (l *routeLoop) exclude(item accounts.Item) {
@@ -758,7 +903,7 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 			if requestContextDone(ctx, err) {
 				return ChatResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 			}
-			if loop.canFailover(classified) {
+			if loop.canFailover(e, classified) {
 				loop.exclude(item)
 				continue
 			}
@@ -808,7 +953,7 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 			}
 			e.markClassified(item.ID, classified, req.Model)
 			status := accounts.AttemptStatusError
-			if loop.canFailover(classified) {
+			if loop.canFailover(e, classified) {
 				status = accounts.AttemptStatusFailover
 				loop.exclude(item)
 				e.recordAttempt(ctx, accounts.RequestAttempt{
@@ -1156,7 +1301,7 @@ func (e ChatExecutor) ChatStreamProxy(ctx context.Context, req translate.ChatReq
 			if requestContextDone(ctx, err) {
 				return StreamResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 			}
-			if loop.canFailover(classified) {
+			if loop.canFailover(e, classified) {
 				loop.exclude(item)
 				continue
 			}
@@ -1206,7 +1351,7 @@ func (e ChatExecutor) ChatStreamProxy(ctx context.Context, req translate.ChatReq
 			finished := time.Now().UTC()
 			latency := int(finished.Sub(started).Milliseconds())
 			status := accounts.AttemptStatusError
-			if loop.canFailover(classified) {
+			if loop.canFailover(e, classified) {
 				status = accounts.AttemptStatusFailover
 				loop.exclude(item)
 				e.recordAttempt(ctx, accounts.RequestAttempt{

@@ -232,3 +232,126 @@ func TestQuotaUsesLongCooldownWithoutRotation(t *testing.T) {
 		t.Fatalf("quota should not remove the account from rotation: %+v", item)
 	}
 }
+
+// TestPickRouteExcludesNoCapacityAccountRegardlessOfForceRoute pins the fix for
+// the cooldown loop: an account with no capacity package can never serve, so it
+// must not be selected even when force-route is on. Force-route exists for
+// accounts that hit a ceiling while some models stay free; an account with no
+// subscription has no such models, and leaving it selectable burned an attempt
+// on a guaranteed quota error before cooling it down again.
+func TestPickRouteExcludesNoCapacityAccountRegardlessOfForceRoute(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{
+		ID: "hd", Provider: "workbuddy", Runtime: "in_process", ForceRoute: true,
+		Quota: &QuotaSnapshot{NoCapacity: true, Exceeded: true, Unit: "credits"},
+	})
+	p.Upsert(Item{
+		ID: "ok", Provider: "workbuddy", Runtime: "in_process",
+		Quota: &QuotaSnapshot{Remaining: 21, CycleRemain: 21, Unit: "credits"},
+	})
+
+	if got := p.LenRoute(RouteQuery{ProviderFilter: "workbuddy"}); got != 1 {
+		t.Fatalf("no-capacity account must not be a candidate: candidates=%d", got)
+	}
+	item, ok := p.PickRoute(RouteQuery{ProviderFilter: "workbuddy"})
+	if !ok || item.ID != "ok" {
+		t.Fatalf("pick = %+v ok=%v", item, ok)
+	}
+	// An explicit pin must not resurrect it either.
+	if pinned, ok := p.PickRoute(RouteQuery{ProviderFilter: "workbuddy", PreferAccount: "hd"}); ok && pinned.ID == "hd" {
+		t.Fatalf("no-capacity account must not be selectable even when pinned: %+v", pinned)
+	}
+}
+
+// TestForceRouteStillBypassesSpentCycle confirms the fix does not over-reach:
+// an account whose cycle is spent but which still holds a package stays
+// selectable under force-route, because free models may still pass the gate.
+func TestForceRouteStillBypassesSpentCycle(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{
+		ID: "spent", Provider: "workbuddy", Runtime: "in_process", ForceRoute: true,
+		Quota: &QuotaSnapshot{Remaining: 100, Total: 100, CycleRemain: 0, Exceeded: true, Unit: "credits"},
+	})
+
+	if got := p.LenRoute(RouteQuery{ProviderFilter: "workbuddy"}); got != 1 {
+		t.Fatalf("force-route must keep a spent-cycle account routable: candidates=%d", got)
+	}
+	if item, ok := p.PickRoute(RouteQuery{ProviderFilter: "workbuddy"}); !ok || item.ID != "spent" {
+		t.Fatalf("pick = %+v ok=%v", item, ok)
+	}
+}
+
+// TestNoCooldownKeepsAccountSchedulable is the guarantee behind exempting the
+// only account that can pass an upstream quota gate: while it is cooling, it
+// must still be a candidate. Without the exemption a single upstream burst
+// takes the whole route down, because there is no other account to carry it.
+func TestNoCooldownKeepsAccountSchedulable(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "only", Provider: "workbuddy", Runtime: "in_process", NoCooldown: true})
+	p.MarkClassified("only", Classified{Kind: KindUnavailable, Cooldown: time.Hour, Message: "502"})
+
+	// Sanity: the cooldown is genuinely recorded, so the assertions below are
+	// about the exemption rather than about a no-op mark.
+	if item, ok := p.ByID("only"); !ok || item.DownUntil.IsZero() {
+		t.Fatalf("expected a recorded cooldown, item=%+v ok=%v", item, ok)
+	}
+	if got := p.LenRoute(RouteQuery{ProviderFilter: "workbuddy"}); got != 1 {
+		t.Fatalf("exempt account must stay routable, candidates=%d", got)
+	}
+	item, ok := p.PickRoute(RouteQuery{ProviderFilter: "workbuddy"})
+	if !ok || item.ID != "only" {
+		t.Fatalf("pick = %+v ok=%v", item, ok)
+	}
+	if ra := p.RetryAfter(item, ""); ra > 0 {
+		t.Fatalf("exempt account must not report a retry delay, got %s", ra)
+	}
+}
+
+// TestCooldownStillHoldsBackNormalAccounts proves the exemption is selective:
+// an account without the flag keeps the existing cooldown behaviour, so the
+// flag does not quietly disable cooldowns pool-wide. A cooling account stays
+// visible as a route so the caller can read its retry hint; what refuses
+// dispatch is that the hint is positive.
+func TestCooldownStillHoldsBackNormalAccounts(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "norm", Provider: "workbuddy", Runtime: "in_process"})
+	p.MarkClassified("norm", Classified{Kind: KindUnavailable, Cooldown: time.Hour, Message: "502"})
+
+	item, ok := p.PickRoute(RouteQuery{ProviderFilter: "workbuddy"})
+	if !ok {
+		t.Fatal("a cooling account is surfaced with a retry hint, not hidden")
+	}
+	if retryAfter := p.RetryAfter(item, ""); retryAfter <= 0 {
+		t.Fatalf("a cooling account must report a retry delay, got %s", retryAfter)
+	}
+}
+
+// TestResetCooldownClearsActiveBackoff pins that enabling the exemption takes
+// effect immediately: leaving the running backoff in place would delay the
+// account until the very moment the exemption was meant to skip.
+func TestResetCooldownClearsActiveBackoff(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "a", Provider: "workbuddy", Runtime: "in_process"})
+	p.MarkClassified("a", Classified{Kind: KindUnavailable, Cooldown: time.Hour, Message: "502"})
+	p.MarkClassified("a", Classified{Kind: KindUnavailable, Cooldown: time.Hour, Message: "502", Model: "hy3"})
+
+	p.ResetCooldown("a")
+
+	item, _ := p.ByID("a")
+	if !item.DownUntil.IsZero() || !item.QuotaDownUntil.IsZero() {
+		t.Fatalf("account cooldown not cleared: %+v", item)
+	}
+	if len(item.ModelDownUntil) != 0 {
+		t.Fatalf("model cooldown not cleared: %+v", item.ModelDownUntil)
+	}
+	if item.BackoffLevel != 0 {
+		t.Fatalf("backoff level not reset: %d", item.BackoffLevel)
+	}
+	// The account is immediately routable again for both routes.
+	if got := p.LenRoute(RouteQuery{ProviderFilter: "workbuddy"}); got != 1 {
+		t.Fatalf("candidates after reset=%d", got)
+	}
+	if got := p.LenRoute(RouteQuery{ProviderFilter: "workbuddy", PublicModel: "hy3"}); got != 1 {
+		t.Fatalf("model candidates after reset=%d", got)
+	}
+}

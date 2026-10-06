@@ -500,7 +500,7 @@ func (m *Manager) startAccount(ctx context.Context, account Account) error {
 		m.pool.Upsert(Item{
 			ID: account.ID, Provider: descriptor.ID, Region: account.ProviderRegion,
 			Runtime: string(descriptor.Runtime), DropSystemPrompt: account.DropSystemPrompt,
-			ForceRoute: account.ForceRoute,
+			ForceRoute: account.ForceRoute, NoCooldown: account.NoCooldown,
 			Weight:     NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
 			RuntimeState: "starting",
 		})
@@ -522,7 +522,7 @@ func (m *Manager) startAccount(ctx context.Context, account Account) error {
 	m.pool.Upsert(Item{
 		ID: account.ID, Provider: descriptor.ID, Region: account.ProviderRegion,
 		Runtime:    string(descriptor.Runtime),
-		ForceRoute: account.ForceRoute,
+		ForceRoute: account.ForceRoute, NoCooldown: account.NoCooldown,
 		Weight:     NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
 		Ready: &notReady, RuntimeState: "starting",
 	})
@@ -552,7 +552,7 @@ func (m *Manager) startAccount(ctx context.Context, account Account) error {
 	m.pool.Upsert(Item{
 		ID: account.ID, URL: process.URL(), Provider: descriptor.ID,
 		Region: account.ProviderRegion, Runtime: string(descriptor.Runtime), Restarts: restarts,
-		ForceRoute: account.ForceRoute,
+		ForceRoute: account.ForceRoute, NoCooldown: account.NoCooldown,
 		Weight:     NormalizeWeight(account.Priority), MaxInFlight: account.MaxInFlight, Quota: account.Quota,
 		Ready: &notReady, RuntimeState: "starting",
 	})
@@ -725,6 +725,15 @@ func (m *Manager) Update(ctx context.Context, id string, input UpdateAccount) er
 	}
 	if before.ForceRoute != after.ForceRoute {
 		m.pool.SetForceRoute(id, after.ForceRoute)
+	}
+	if before.NoCooldown != after.NoCooldown {
+		m.pool.SetNoCooldown(id, after.NoCooldown)
+		// Clear the backoff that is already running: the point of the flag is
+		// to make the account usable now, so leaving the current cooldown in
+		// place would delay it until the very moment it was meant to skip.
+		if after.NoCooldown {
+			m.pool.ResetCooldown(id)
+		}
 	}
 	if before.Priority != after.Priority {
 		m.pool.SetWeight(id, after.Priority)
@@ -940,6 +949,7 @@ type ImportAccount struct {
 	WorkBuddyAutoCheckin *bool
 	WorkBuddyCheckinTime string
 	ForceRoute           *bool
+	NoCooldown           *bool
 	Credential           NativeCredential
 }
 
@@ -964,6 +974,7 @@ func (m *Manager) Import(ctx context.Context, input ImportAccount) (Account, err
 		WorkBuddyAutoCheckin: input.WorkBuddyAutoCheckin,
 		WorkBuddyCheckinTime: input.WorkBuddyCheckinTime,
 		ForceRoute:           input.ForceRoute,
+		NoCooldown:           input.NoCooldown,
 	})
 	if err != nil {
 		return Account{}, err
@@ -1221,13 +1232,15 @@ func (m *Manager) fetchProviderQuota(ctx context.Context, accountID string, prob
 		unit = "credits"
 	}
 	quota := &QuotaSnapshot{
-		Used:       info.Used,
-		Total:      info.Total,
-		Remaining:  info.Remaining,
-		Percentage: info.Percentage,
-		Unit:       unit,
-		Exceeded:   info.Exceeded,
-		FetchedAt:  info.FetchedAt,
+		Used:        info.Used,
+		Total:       info.Total,
+		Remaining:   info.Remaining,
+		Percentage:  info.Percentage,
+		Unit:        unit,
+		Exceeded:    info.Exceeded,
+		CycleRemain: info.CycleRemain,
+		NoCapacity:  info.NoCapacity,
+		FetchedAt:   info.FetchedAt,
 	}
 	m.persistQuota(ctx, accountID, quota)
 }
@@ -1240,7 +1253,11 @@ func (m *Manager) persistQuota(ctx context.Context, accountID string, quota *Quo
 	// must not clear an exhaustion the upstream itself confirmed. Otherwise an
 	// account that keeps answering "credits exhausted" but reports no plan
 	// would be re-admitted to routing on every probe and cool down again.
-	if !quota.Exceeded && quota.Total <= 0 && quota.Remaining <= 0 {
+	//
+	// A probe that positively found no capacity package is exempt: that is a
+	// definite answer, and it is what finally takes an unusable account out of
+	// routing instead of leaving it stuck in the cooldown loop.
+	if !quota.Exceeded && !quota.NoCapacity && quota.Total <= 0 && quota.Remaining <= 0 {
 		if item, ok := m.pool.ByID(accountID); ok && item.Quota != nil && item.Quota.Exceeded {
 			return
 		}

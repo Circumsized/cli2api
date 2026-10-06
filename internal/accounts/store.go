@@ -45,6 +45,10 @@ type Account struct {
 	// models do not consume credits, so an exhausted account can still serve
 	// them; without this the account is excluded from every route.
 	ForceRoute bool `json:"force_route"`
+	// NoCooldown exempts the account from every cooldown kind so it is always
+	// schedulable. Set it on an account the pool cannot afford to rest, such as
+	// the only one that can pass an upstream quota gate.
+	NoCooldown bool `json:"no_cooldown"`
 	// LastCheckin* are display-only WorkBuddy ops results.
 	LastCheckinAt     string         `json:"last_checkin_at,omitempty"`
 	LastCheckinMsg    string         `json:"last_checkin_msg,omitempty"`
@@ -69,6 +73,7 @@ type CreateAccount struct {
 	WorkBuddyAutoCheckin *bool
 	WorkBuddyCheckinTime string
 	ForceRoute           *bool
+	NoCooldown           *bool
 }
 
 type UpdateAccount struct {
@@ -80,6 +85,7 @@ type UpdateAccount struct {
 	WorkBuddyAutoCheckin *bool
 	WorkBuddyCheckinTime *string
 	ForceRoute           *bool
+	NoCooldown           *bool
 }
 
 type NativeCredential struct {
@@ -158,6 +164,10 @@ func (s *Store) Create(ctx context.Context, input CreateAccount) (Account, error
 		return Account{}, err
 	}
 	forceRoute := false
+	noCooldown := false
+	if input.NoCooldown != nil {
+		noCooldown = *input.NoCooldown
+	}
 	if input.ForceRoute != nil {
 		forceRoute = *input.ForceRoute
 	}
@@ -174,6 +184,7 @@ func (s *Store) Create(ctx context.Context, input CreateAccount) (Account, error
 		WorkBuddyAutoCheckin: autoCheckin,
 		WorkBuddyCheckinTime: checkinTime,
 		ForceRoute:           forceRoute,
+		NoCooldown:           noCooldown,
 		Status:               "offline",
 		CreatedAt:            now,
 		UpdatedAt:            now,
@@ -181,11 +192,11 @@ func (s *Store) Create(ctx context.Context, input CreateAccount) (Account, error
 	_, err = s.db.ExecContext(ctx, `
 	INSERT INTO accounts (
 	  id, name, provider, provider_region, auth_type, enabled, max_inflight, priority, drop_system_prompt,
-	  workbuddy_auto_checkin, workbuddy_checkin_time, force_route, status, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	  workbuddy_auto_checkin, workbuddy_checkin_time, force_route, no_cooldown, status, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		account.ID, account.Name, account.Provider, account.ProviderRegion, account.AuthType,
 		account.Enabled, account.MaxInFlight, account.Priority, account.DropSystemPrompt,
-		account.WorkBuddyAutoCheckin, account.WorkBuddyCheckinTime, account.ForceRoute, account.Status,
+		account.WorkBuddyAutoCheckin, account.WorkBuddyCheckinTime, account.ForceRoute, account.NoCooldown, account.Status,
 		formatTime(account.CreatedAt), formatTime(account.UpdatedAt),
 	)
 	if err != nil {
@@ -197,7 +208,7 @@ func (s *Store) Create(ctx context.Context, input CreateAccount) (Account, error
 func (s *Store) Get(ctx context.Context, id string) (Account, error) {
 	row := s.db.QueryRowContext(ctx, `
 	SELECT id, name, provider, provider_region, remote_uid, auth_type, enabled, max_inflight, priority,
-	       drop_system_prompt, workbuddy_auto_checkin, workbuddy_checkin_time, force_route, last_checkin_at, last_checkin_msg, last_checkin_status,
+	       drop_system_prompt, workbuddy_auto_checkin, workbuddy_checkin_time, force_route, no_cooldown, last_checkin_at, last_checkin_msg, last_checkin_status,
 	       status, last_error, last_error_kind, cooldown_until, quota_json, created_at, updated_at
 	FROM accounts WHERE id = ?`, strings.TrimSpace(id))
 	account, err := scanAccount(row)
@@ -220,7 +231,7 @@ func scanAccount(row rowScanner) (Account, error) {
 	err := row.Scan(
 		&account.ID, &account.Name, &account.Provider, &account.ProviderRegion, &account.RemoteUID,
 		&account.AuthType, &account.Enabled, &account.MaxInFlight, &account.Priority,
-		&account.DropSystemPrompt, &account.WorkBuddyAutoCheckin, &account.WorkBuddyCheckinTime, &account.ForceRoute, &account.LastCheckinAt, &account.LastCheckinMsg, &account.LastCheckinStatus,
+		&account.DropSystemPrompt, &account.WorkBuddyAutoCheckin, &account.WorkBuddyCheckinTime, &account.ForceRoute, &account.NoCooldown, &account.LastCheckinAt, &account.LastCheckinMsg, &account.LastCheckinStatus,
 		&account.Status, &account.LastError, &account.LastErrorKind, &cooldown, &quotaJSON, &created, &updated,
 	)
 	if err != nil {
@@ -270,7 +281,7 @@ func parseTime(value string) time.Time {
 func (s *Store) List(ctx context.Context) ([]Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
 	SELECT id, name, provider, provider_region, remote_uid, auth_type, enabled, max_inflight, priority,
-	       drop_system_prompt, workbuddy_auto_checkin, workbuddy_checkin_time, force_route, last_checkin_at, last_checkin_msg, last_checkin_status,
+	       drop_system_prompt, workbuddy_auto_checkin, workbuddy_checkin_time, force_route, no_cooldown, last_checkin_at, last_checkin_msg, last_checkin_status,
 	       status, last_error, last_error_kind, cooldown_until, quota_json, created_at, updated_at
 	FROM accounts ORDER BY created_at, id`)
 	if err != nil {
@@ -317,15 +328,18 @@ func (s *Store) Update(ctx context.Context, id string, input UpdateAccount) erro
 			return err
 		}
 	}
+	if input.NoCooldown != nil {
+		account.NoCooldown = *input.NoCooldown
+	}
 	if input.ForceRoute != nil {
 		account.ForceRoute = *input.ForceRoute
 	}
 	account.UpdatedAt = time.Now().UTC()
 	result, err := s.db.ExecContext(ctx, `
 	UPDATE accounts SET name = ?, enabled = ?, max_inflight = ?, priority = ?, drop_system_prompt = ?,
-	                    workbuddy_auto_checkin = ?, workbuddy_checkin_time = ?, force_route = ?, updated_at = ?
+	                    workbuddy_auto_checkin = ?, workbuddy_checkin_time = ?, force_route = ?, no_cooldown = ?, updated_at = ?
 	WHERE id = ?`, account.Name, account.Enabled, account.MaxInFlight, account.Priority, account.DropSystemPrompt,
-		account.WorkBuddyAutoCheckin, account.WorkBuddyCheckinTime, account.ForceRoute, formatTime(account.UpdatedAt), account.ID)
+		account.WorkBuddyAutoCheckin, account.WorkBuddyCheckinTime, account.ForceRoute, account.NoCooldown, formatTime(account.UpdatedAt), account.ID)
 	if err != nil {
 		return fmt.Errorf("update account: %w", err)
 	}

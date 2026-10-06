@@ -212,6 +212,8 @@ ALTER TABLE request_logs ADD COLUMN message_roles TEXT NOT NULL DEFAULT '';`},
 ALTER TABLE accounts ADD COLUMN workbuddy_checkin_time TEXT NOT NULL DEFAULT '09:00';`},
 	{filename: "021_account_force_route.sql", sql: `
 ALTER TABLE accounts ADD COLUMN force_route INTEGER NOT NULL DEFAULT 0;`},
+	{filename: "022_account_no_cooldown.sql", sql: `
+ALTER TABLE accounts ADD COLUMN no_cooldown INTEGER NOT NULL DEFAULT 0;`},
 }
 
 const schemaMigrationsDDL = `

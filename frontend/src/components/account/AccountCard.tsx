@@ -53,6 +53,7 @@ type Props = {
   onToggleDropSystem: (selected: boolean) => void
   onToggleAutoCheckin?: (selected: boolean) => void
   onToggleForceRoute?: (selected: boolean) => void
+  onToggleNoCooldown?: (selected: boolean) => void
   onCheckin?: () => void
   onViewCheckins?: () => void
   onEdit: () => void
@@ -106,6 +107,7 @@ export function AccountCard({
   onToggleDropSystem,
   onToggleAutoCheckin,
   onToggleForceRoute,
+  onToggleNoCooldown,
   onCheckin,
   onViewCheckins,
   onEdit,
@@ -298,6 +300,8 @@ export function AccountCard({
               addOnLabel={t('quotaAddOn')}
               resourcePackageLabel={t('quotaResourcePackage')}
               exceededLabel={t('quotaExceeded')}
+              cycleLabel={t('quotaCycle')}
+              noCapacityLabel={t('quotaNoCapacity')}
             />
           ) : <span className="text-[11px] text-foreground/65">{state === 'loading' ? t('quotaLoading') : t('quotaUnavailable')}</span>}
         </div>
@@ -351,6 +355,20 @@ export function AccountCard({
                 isDisabled={busyKind === 'toggle' || !onToggleForceRoute}
                 ariaLabel={t('forceRoute')}
                 onChange={(selected) => onToggleForceRoute?.(selected)}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3 text-[11px]">
+              <Tooltip>
+                <Tooltip.Trigger>
+                  <span className="font-medium">{t('noCooldown')}</span>
+                </Tooltip.Trigger>
+                <Tooltip.Content>{t('noCooldownHint')}</Tooltip.Content>
+              </Tooltip>
+              <CompactSwitch
+                isSelected={Boolean(account.no_cooldown)}
+                isDisabled={busyKind === 'toggle' || !onToggleNoCooldown}
+                ariaLabel={t('noCooldown')}
+                onChange={(selected) => onToggleNoCooldown?.(selected)}
               />
             </div>
           </div>

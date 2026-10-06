@@ -10,9 +10,11 @@ type Props = {
   addOnLabel: string
   resourcePackageLabel: string
   exceededLabel: string
+  cycleLabel: string
+  noCapacityLabel: string
 }
 
-export function QuotaMeter({ quota, label, usedLabel, remainingLabel, addOnLabel, resourcePackageLabel, exceededLabel }: Props) {
+export function QuotaMeter({ quota, label, usedLabel, remainingLabel, addOnLabel, resourcePackageLabel, exceededLabel, cycleLabel, noCapacityLabel }: Props) {
   const ratio = quotaUsedRatio(quota)
   const tone = quotaTone(quota)
   const color = tone === 'danger' ? 'danger' : tone === 'warn' ? 'warning' : 'success'
@@ -25,6 +27,12 @@ export function QuotaMeter({ quota, label, usedLabel, remainingLabel, addOnLabel
   const resourcePackage = quota.has_resource_package && quota.resource_package_available !== false
     ? `${resourcePackageLabel} ${remainingLabel} ${formatQuotaAmount(quota.resource_package_remaining)} ${quota.resource_package_unit || 'credits'}`
     : ''
+  // Upstream gates chat on the cycle allowance, not the package balance, so a
+  // zero cycle next to a full package is the difference between "usable" and
+  // "blocked". Showing it keeps that distinction visible on the card.
+  const cycle = quota.no_capacity
+    ? noCapacityLabel
+    : `${cycleLabel} ${formatQuotaAmount(quota.cycle_remain)} ${unit}`
 
   return (
     <Meter
@@ -35,14 +43,14 @@ export function QuotaMeter({ quota, label, usedLabel, remainingLabel, addOnLabel
       maxValue={100}
       value={Math.round(ratio * 100)}
       aria-label={label}
-      valueLabel={`${usedLabel} ${used} · ${remainingLabel} ${remaining}${addOn ? ` · ${addOn}` : ''}${resourcePackage ? ` · ${resourcePackage}` : ''}`}
+      valueLabel={`${usedLabel} ${used} · ${remainingLabel} ${remaining} · ${cycle}${addOn ? ` · ${addOn}` : ''}${resourcePackage ? ` · ${resourcePackage}` : ''}`}
     >
       <Label className="text-[11px] font-medium">
         {label}
         {quota.exceeded ? <span className="ml-1.5 text-danger">{exceededLabel}</span> : null}
       </Label>
       <Meter.Output className="mono text-[10px] text-foreground/65">
-        {usedLabel} {used} · {remainingLabel} {remaining}
+        {usedLabel} {used} · {remainingLabel} {remaining} · {cycle}
         {addOn ? ` · ${addOn}` : ''}
         {resourcePackage ? ` · ${resourcePackage}` : ''}
       </Meter.Output>

@@ -457,11 +457,9 @@ func TestModelsParsesReasoningOptions(t *testing.T) {
 	}
 }
 
-// The deepseek alias is a public name only. The upstream catalog has no
-// "deepseek-v4.1-flash" entry, so the alias must keep the native spelling of
-// the model it resolves to; otherwise the chat request names an ID the
-// upstream catalog does not contain and it answers with a quota error.
-func TestAliasModelKeepsNativeSpelling(t *testing.T) {
+// The deepseek alias exposes "deepseek-v4.1-flash" publicly while ensuring
+// the native model sent upstream matches what the upstream inference engine accepts.
+func TestAliasModelExposesDeepseekNativeSpelling(t *testing.T) {
 	payload, _ := Credential{AccessToken: "at", UID: "u1", Domain: "www.workbuddy.ai", ExpiresAt: 4102444800}.Encode()
 	store := &memStore{items: map[string][]byte{"acc1": payload}, region: "global"}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -491,8 +489,8 @@ func TestAliasModelKeepsNativeSpelling(t *testing.T) {
 	if !found {
 		t.Fatalf("alias missing from catalog: %+v", models)
 	}
-	if alias.NativeModel != "deep-model" {
-		t.Fatalf("alias must keep the native upstream ID, got native=%q", alias.NativeModel)
+	if alias.NativeModel != "deepseek-v4.1-flash" {
+		t.Fatalf("alias must use deepseek-v4.1-flash as native model, got native=%q", alias.NativeModel)
 	}
 }
 
@@ -1279,5 +1277,105 @@ func TestRateLimitErrorCarriesResetCooldown(t *testing.T) {
 	}
 	if out.Cooldown <= 28*time.Minute || out.Cooldown > 30*time.Minute {
 		t.Fatalf("cooldown=%v want ~30m", out.Cooldown)
+	}
+}
+
+// TestQuotaCycleSpentReportsExceeded covers the case that made an account look
+// healthy while upstream refused every request: the package balance is intact
+// but the billing cycle is spent, so chat is gated off.
+func TestQuotaCycleSpentReportsExceeded(t *testing.T) {
+	client, store := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"data": map[string]any{"Response": map[string]any{"Data": map[string]any{
+				"TotalDosage": 100,
+				"Accounts": []map[string]any{{
+					"CapacityRemain": 100, "CapacitySize": 100, "CapacityUsed": 0,
+					"CycleCapacitySize": 100, "CycleCapacityRemain": 0, "CycleCapacityUsed": 100,
+				}},
+			}}},
+		})
+	}))
+	payload, _ := json.Marshal(Credential{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 4102444800, Domain: DomainCN, UID: "u1",
+	})
+	_ = store.SaveCredentialPayload(context.Background(), "acc1", CredentialFormat, payload)
+
+	info, err := client.Quota(context.Background(), "acc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Exceeded {
+		t.Fatalf("a spent cycle must report exceeded: %+v", info)
+	}
+	if info.CycleRemain != 0 || info.Remaining != 0 {
+		t.Fatalf("a spent cycle must report zero allowance: %+v", info)
+	}
+	if info.NoCapacity {
+		t.Fatalf("an account holding a package is not no-capacity: %+v", info)
+	}
+}
+
+// TestQuotaNoCapacityPackageIsDefinite pins the signal that takes an account
+// with no subscription out of routing for good, instead of letting it cycle
+// through re-admission, 14018, and cooldown on every health refresh.
+func TestQuotaNoCapacityPackageIsDefinite(t *testing.T) {
+	client, store := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"data": map[string]any{"Response": map[string]any{"Data": map[string]any{
+				"TotalDosage": 0, "Accounts": nil,
+			}}},
+		})
+	}))
+	payload, _ := json.Marshal(Credential{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 4102444800, Domain: DomainCN, UID: "u1",
+	})
+	_ = store.SaveCredentialPayload(context.Background(), "acc1", CredentialFormat, payload)
+
+	info, err := client.Quota(context.Background(), "acc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.NoCapacity || !info.Exceeded {
+		t.Fatalf("no package must be a definite no-capacity answer: %+v", info)
+	}
+}
+
+// TestQuotaCycleRemainingAdmits pins the inverse: a positive cycle allowance
+// admits the account even though the package balance alone would not say so.
+func TestQuotaCycleRemainingAdmits(t *testing.T) {
+	client, store := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"data": map[string]any{"Response": map[string]any{"Data": map[string]any{
+				"TotalDosage": 121,
+				"Accounts": []map[string]any{{
+					"CapacityRemain": 100, "CapacitySize": 100,
+					"CycleCapacitySize": 100, "CycleCapacityRemain": 0, "CycleCapacityUsed": 100,
+				}, {
+					"CapacityRemain": 21, "CapacitySize": 30,
+					"CycleCapacitySize": 30, "CycleCapacityRemain": 21, "CycleCapacityUsed": 8,
+				}},
+			}}},
+		})
+	}))
+	payload, _ := json.Marshal(Credential{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 4102444800, Domain: DomainCN, UID: "u1",
+	})
+	_ = store.SaveCredentialPayload(context.Background(), "acc1", CredentialFormat, payload)
+
+	info, err := client.Quota(context.Background(), "acc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Exceeded {
+		t.Fatalf("a positive cycle allowance must not be exceeded: %+v", info)
+	}
+	if info.CycleRemain != 21 {
+		t.Fatalf("cycle remain must sum only positive allowances: %+v", info)
 	}
 }

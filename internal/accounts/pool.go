@@ -29,7 +29,16 @@ type QuotaSnapshot struct {
 	ResourcePackageRemaining float64 `json:"resource_package_remaining"`
 	ResourcePackageUnit      string  `json:"resource_package_unit"`
 	ResourcePackageAvailable *bool   `json:"resource_package_available,omitempty"`
-	FetchedAt                string  `json:"fetched_at"`
+	// CycleRemain is the current billing cycle's remaining allowance summed
+	// over every package. Upstream admits chat on this value, so it can be 0
+	// while Remaining still shows an untouched package balance. Surfacing it
+	// keeps "the cycle is spent" distinguishable from "the plan is exhausted".
+	CycleRemain float64 `json:"cycle_remain"`
+	// NoCapacity marks an account whose probe succeeded but found no capacity
+	// package at all. Such an account can never serve, so it must stay out of
+	// routing instead of being re-admitted on every refresh.
+	NoCapacity bool   `json:"no_capacity,omitempty"`
+	FetchedAt  string `json:"fetched_at"`
 }
 
 const (
@@ -111,6 +120,11 @@ type Item struct {
 	// Some upstream models do not consume credits, so an exhausted account
 	// can still serve them.
 	ForceRoute bool
+	// NoCooldown exempts this account from every cooldown kind, so it is
+	// always schedulable. Use it for an account the pool cannot afford to rest:
+	// when it is the only one that can serve, a backoff protects nothing and
+	// takes the whole route down with it.
+	NoCooldown bool
 	// ModelNative maps a canonical public model ID to the provider-native
 	// spelling that must be sent upstream. Providers may expose a public alias
 	// whose native ID differs; routing matches on the public ID but the
@@ -373,6 +387,15 @@ func itemReady(item Item) bool {
 }
 
 func routeBaseMatches(item Item, q RouteQuery) bool {
+	// An account with no capacity package cannot serve any model, so it never
+	// becomes a routing candidate. This is deliberately independent of
+	// ForceRoute: force-route exists for accounts that hit a quota ceiling
+	// while some models stay free, and an account holding no subscription at
+	// all has no such models. Leaving it selectable made every request spend
+	// an attempt on a guaranteed 14018 and then cool the account down again.
+	if item.Quota != nil && item.Quota.NoCapacity {
+		return false
+	}
 	if item.Quota != nil && item.Quota.Exceeded && !item.ForceRoute {
 		return false
 	}
@@ -807,6 +830,9 @@ func itemSaturated(item Item) bool {
 // itemModelDown applies the per-model cooldown: one model hitting a limit
 // must not take the whole account offline for other models.
 func itemModelDown(item Item, q RouteQuery, now time.Time) bool {
+	if item.NoCooldown {
+		return false
+	}
 	model := routeModel(q.PublicModel)
 	if model == "" {
 		return false
@@ -825,6 +851,9 @@ func quotaBlocked(item Item, now time.Time) bool {
 // resumeAt is the moment an item becomes usable again for this route,
 // considering both account-level and model-level cooldowns.
 func resumeAt(item Item, q RouteQuery) time.Time {
+	if item.NoCooldown {
+		return time.Time{}
+	}
 	next := item.DownUntil
 	if item.ForceRoute && quotaBlocked(item, time.Now()) {
 		next = time.Time{}
@@ -1136,6 +1165,58 @@ func (p *Pool) SetForceRoute(id string, force bool) {
 	}
 }
 
+// SetNoCooldown updates only the cooldown-exemption flag on a live item.
+// Routing picks it up on the next request, and clearing an active cooldown is
+// the caller's job via ResetCooldown.
+func (p *Pool) SetNoCooldown(id string, exempt bool) {
+	if p == nil || id == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.items {
+		if p.items[i].ID == id {
+			p.items[i].NoCooldown = exempt
+			return
+		}
+	}
+}
+
+// ResetCooldown clears every cooldown a single account currently holds and
+// notifies the observer so the cleared state reaches SQLite. It exists for the
+// moment an account is exempted from cooldown: without it the flag would only
+// take effect after the in-flight backoff expires, which is the very delay the
+// exemption is meant to remove.
+func (p *Pool) ResetCooldown(id string) {
+	if p == nil || id == "" {
+		return
+	}
+	var changed *Item
+	p.mu.Lock()
+	for i := range p.items {
+		if p.items[i].ID != id {
+			continue
+		}
+		p.items[i].DownUntil = time.Time{}
+		p.items[i].QuotaDownUntil = time.Time{}
+		p.items[i].LastKind = ""
+		p.items[i].BackoffLevel = 0
+		p.items[i].ModelDownUntil = map[string]time.Time{}
+		p.items[i].ModelBackoff = map[string]int{}
+		p.items[i].ModelLastKind = map[string]string{}
+		p.stateCounter++
+		p.items[i].StateVersion = p.stateCounter
+		snapshot := p.items[i].clone()
+		changed = &snapshot
+		break
+	}
+	observer := p.observer
+	p.mu.Unlock()
+	if changed != nil && observer != nil {
+		observer(*changed)
+	}
+}
+
 func (p *Pool) MergeHealth(id string, ready, hot bool, inFlight, restarts int, lastError string) {
 	if p == nil || id == "" {
 		return
@@ -1352,6 +1433,13 @@ func (p *Pool) Snapshot() []map[string]any {
 }
 
 func itemDown(item Item, now time.Time) bool {
+	// An account exempted from cooldown is always schedulable. This is for the
+	// case where the pool has no alternative: sitting out a backoff protects
+	// nothing when there is no other account to absorb the traffic, and it
+	// removes the only account that could serve.
+	if item.NoCooldown {
+		return false
+	}
 	until := item.DownUntil
 	if item.ForceRoute && quotaBlocked(item, now) {
 		until = time.Time{}
